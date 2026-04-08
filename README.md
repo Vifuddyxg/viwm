@@ -22,13 +22,14 @@ Examples:
 - Void: `sudo xbps-install libX11-devel libxinerama-devel`
 - Gentoo: `x11-libs/libX11 x11-libs/libXinerama`
 
+## Build
 
-Build
-
- git clone https://github.com/Vifuddyxg/viwm/
+  ```
+  git clone https://github.com/Vifuddyxg/viwm/
   cd viwm
   make
   sudo make install
+  ```
 
 
 
