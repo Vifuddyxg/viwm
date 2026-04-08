@@ -3,6 +3,7 @@
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
 #include <X11/Xatom.h>
+#include <X11/cursorfont.h>
 #include <X11/XF86keysym.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -99,6 +100,7 @@ static int cmd_limit = MAXCMDS;
 static int autostart_limit = MAXAUTOSTART;
 static GC bargc;
 static XFontStruct *barfont;
+static Cursor normalcursor;
 static InputMode mode = MODE_INSERT;
 static int keyboard_grabbed;
 static int running = 1;
@@ -121,6 +123,8 @@ static void update_clock(void);
 static void update_battery(void);
 static void setupbars(void);
 static Node *mon_focused(int mi);
+static void showtree(Node *n);
+static void spawn(const char *cmd);
 static unsigned long hcol(const char *s) {
     return strtoul(*s == '#' ? s + 1 : s, NULL, 16);
 }
@@ -385,6 +389,14 @@ static Node *firstleaf(Node *n) {
     return n;
 }
 
+static Node *find_fullscreen_leaf(Node *n) {
+    Node *r;
+    if (!n) return NULL;
+    if (n->leaf) return n->fullscreen ? n : NULL;
+    r = find_fullscreen_leaf(n->a);
+    return r ? r : find_fullscreen_leaf(n->b);
+}
+
 static int workspace_has_windows(int ws) {
     for (int i = 0; i < nmons; i++) {
         if (mons[i].tree[ws]) return 1;
@@ -460,6 +472,17 @@ static void raise_floating(Node *n) {
     }
     raise_floating(n->a);
     raise_floating(n->b);
+}
+
+static void show_only_leaf(Node *n, Node *target) {
+    if (!n) return;
+    if (n->leaf) {
+        if (n == target) XMapRaised(dpy, n->win);
+        else XUnmapWindow(dpy, n->win);
+        return;
+    }
+    show_only_leaf(n->a, target);
+    show_only_leaf(n->b, target);
 }
 
 static void tilenode(Node *n, int x, int y, int w, int h, Node *foc) {
@@ -633,8 +656,17 @@ static void drawbars(void) {
 static void retile(void) {
     for (int i = 0; i < nmons; i++) {
         Mon *m = &mons[i];
-        tilenode(mon_tree(i), m->wx, m->wy, m->ww, m->wh, mon_focused(i));
-        raise_floating(mon_tree(i));
+        Node *fs = find_fullscreen_leaf(mon_tree(i));
+        if (fs) {
+            show_only_leaf(mon_tree(i), fs);
+            drawborder(fs, fs == mon_focused(i));
+            XMoveResizeWindow(dpy, fs->win, m->wx, m->wy, m->ww - 2 * bw, m->wh - 2 * bw);
+            XRaiseWindow(dpy, fs->win);
+        } else {
+            showtree(mon_tree(i));
+            tilenode(mon_tree(i), m->wx, m->wy, m->ww, m->wh, mon_focused(i));
+            raise_floating(mon_tree(i));
+        }
         if (m->barwin) XRaiseWindow(dpy, m->barwin);
     }
     drawbars();
@@ -837,6 +869,19 @@ static void move_focused_to_workspace_and_follow(int targetws) {
     if (targetws < 0 || targetws >= MAXWS || targetws == curws) return;
     move_focused_to_workspace(targetws);
     switch_workspace(targetws);
+}
+
+static void screenshot(void) {
+    const char *cmd =
+        "mkdir -p \"$HOME/Pictures/Screenshots\" && "
+        "if command -v maim >/dev/null 2>&1; then "
+        "maim \"$HOME/Pictures/Screenshots/$(date +%Y-%m-%d-%H%M%S).png\"; "
+        "elif command -v scrot >/dev/null 2>&1; then "
+        "scrot \"$HOME/Pictures/Screenshots/%Y-%m-%d-%H%M%S.png\"; "
+        "elif command -v import >/dev/null 2>&1; then "
+        "import -window root \"$HOME/Pictures/Screenshots/$(date +%Y-%m-%d-%H%M%S).png\"; "
+        "fi";
+    spawn(cmd);
 }
 
 static void spawn(const char *cmd) {
@@ -1194,6 +1239,10 @@ static int apply_wm_action(const char *action) {
         XRaiseWindow(dpy, mon_focused(curmon)->win);
         return 1;
     }
+    if (!strcmp(action, "wm:screenshot")) {
+        screenshot();
+        return 1;
+    }
     if (!strcmp(action, "wm:toggle_split")) {
         if (mon_focused(curmon) && mon_focused(curmon)->par) {
             mon_focused(curmon)->par->horiz ^= 1;
@@ -1303,6 +1352,7 @@ static void setupbars(void) {
             m->wy = m->y;
             m->barwin = XCreateSimpleWindow(dpy, root, m->x, m->y + m->h - barh, m->w, barh, 0, barbg, barbg);
         }
+        XDefineCursor(dpy, m->barwin, normalcursor);
         XSelectInput(dpy, m->barwin, ExposureMask);
         XMapRaised(dpy, m->barwin);
     }
@@ -1319,6 +1369,8 @@ int main(void) {
     root = RootWindow(dpy, scr);
     sw = DisplayWidth(dpy, scr);
     sh = DisplayHeight(dpy, scr);
+    normalcursor = XCreateFontCursor(dpy, XC_left_ptr);
+    XDefineCursor(dpy, root, normalcursor);
 
     int xiev, xierr;
     if (XineramaQueryExtension(dpy, &xiev, &xierr) && XineramaIsActive(dpy)) {
@@ -1532,6 +1584,10 @@ int main(void) {
             }
             if (state == (ControlMask | Mod4Mask) && sym == XK_Right) {
                 apply_wm_action("wm:swap_next");
+                break;
+            }
+            if (state == 0 && (sym == XK_Print || sym == XK_Sys_Req)) {
+                apply_wm_action("wm:screenshot");
                 break;
             }
             if (state == MOD && sym == XK_Left) {
