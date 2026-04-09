@@ -29,8 +29,9 @@ typedef struct Node Node;
 struct Node {
     int leaf, floating, horiz;
     int fullscreen;
+    int real_fullscreen;
     float ratio;
-    Node *a, *b, *par;
+    Node *a, *b, *par, *next;
     Window win;
     int x, y, w, h;
 };
@@ -55,6 +56,7 @@ typedef struct {
     int x, y, w, h;
     int wx, wy, ww, wh;
     Node *tree[MAXWS], *focused[MAXWS];
+    Node *floating[MAXWS];
     Window barwin;
 } Mon;
 
@@ -116,6 +118,12 @@ static int drag_ox, drag_oy;
 static int drag_wx, drag_wy;
 static int drag_ww, drag_wh;
 static Node *drag_node;
+static Window wmcheckwin;
+static Atom atom_net_wm_state;
+static Atom atom_net_wm_state_fullscreen;
+static Atom atom_net_supported;
+static Atom atom_net_supporting_wm_check;
+static Atom atom_utf8_string;
 
 static int xerr(Display *d, XErrorEvent *e) { (void)d; (void)e; return 0; }
 static void drawbars(void);
@@ -124,7 +132,10 @@ static void update_battery(void);
 static void setupbars(void);
 static Node *mon_focused(int mi);
 static void showtree(Node *n);
+static void collect_leaves(Node *n, Node **list, int *count, int maxcount);
 static void spawn(const char *cmd);
+static void setup_wm_check(void);
+static void update_supported_atoms(void);
 static unsigned long hcol(const char *s) {
     return strtoul(*s == '#' ? s + 1 : s, NULL, 16);
 }
@@ -280,9 +291,8 @@ static void update_clock(void) {
 }
 
 static void update_battery(void) {
-    static int last_battery_second = -1;
+    static time_t last_battery_update = 0;
     time_t now = time(NULL);
-    struct tm tm_now;
     const char *bases[] = {
         "/sys/class/power_supply/BAT0",
         "/sys/class/power_supply/BAT1",
@@ -292,9 +302,8 @@ static void update_battery(void) {
     char path[256], status[32], cap[32];
     FILE *f;
 
-    localtime_r(&now, &tm_now);
-    if (tm_now.tm_sec == last_battery_second) return;
-    last_battery_second = tm_now.tm_sec;
+    if (last_battery_update && now - last_battery_update < 15) return;
+    last_battery_update = now;
     batterystr[0] = 0;
 
     for (int i = 0; bases[i]; i++) {
@@ -350,6 +359,10 @@ static Node *mon_focused_at(int mi, int ws) {
     return mons[mi].focused[ws];
 }
 
+static Node *mon_floating_at(int mi, int ws) {
+    return mons[mi].floating[ws];
+}
+
 static void mon_setfocused(int mi, Node *n) {
     mons[mi].focused[curws] = n;
 }
@@ -360,6 +373,10 @@ static void mon_settree_at(int mi, int ws, Node *n) {
 
 static void mon_setfocused_at(int mi, int ws, Node *n) {
     mons[mi].focused[ws] = n;
+}
+
+static void mon_setfloating_at(int mi, int ws, Node *n) {
+    mons[mi].floating[ws] = n;
 }
 
 static Node *mkleaf(Window w) {
@@ -377,9 +394,39 @@ static Node *findleaf(Node *n, Window w) {
     return r ? r : findleaf(n->b, w);
 }
 
+static Node *findfloating(Node *n, Window w) {
+    for (; n; n = n->next) {
+        if (n->win == w) return n;
+    }
+    return NULL;
+}
+
+static Node *findnode_in_ws(int mi, int ws, Window w) {
+    Node *n = findleaf(mon_tree_at(mi, ws), w);
+    return n ? n : findfloating(mon_floating_at(mi, ws), w);
+}
+
+static Node *findnode(int mi, Window w) {
+    return findnode_in_ws(mi, curws, w);
+}
+
+static Node *findnode_any(Window w, int *out_mi, int *out_ws) {
+    for (int mi = 0; mi < nmons; mi++) {
+        for (int ws = 0; ws < MAXWS; ws++) {
+            Node *n = findnode_in_ws(mi, ws, w);
+            if (n) {
+                if (out_mi) *out_mi = mi;
+                if (out_ws) *out_ws = ws;
+                return n;
+            }
+        }
+    }
+    return NULL;
+}
+
 static int monforwin(Window w) {
     for (int i = 0; i < nmons; i++) {
-        if (findleaf(mon_tree(i), w)) return i;
+        if (findnode(i, w)) return i;
     }
     return curmon;
 }
@@ -392,9 +439,17 @@ static Node *firstleaf(Node *n) {
 static Node *find_fullscreen_leaf(Node *n) {
     Node *r;
     if (!n) return NULL;
-    if (n->leaf) return n->fullscreen ? n : NULL;
+    if (n->leaf) return (n->fullscreen || n->real_fullscreen) ? n : NULL;
     r = find_fullscreen_leaf(n->a);
     return r ? r : find_fullscreen_leaf(n->b);
+}
+
+static Node *find_real_fullscreen_leaf(Node *n) {
+    Node *r;
+    if (!n) return NULL;
+    if (n->leaf) return n->real_fullscreen ? n : NULL;
+    r = find_real_fullscreen_leaf(n->a);
+    return r ? r : find_real_fullscreen_leaf(n->b);
 }
 
 static int workspace_has_windows(int ws) {
@@ -404,43 +459,35 @@ static int workspace_has_windows(int ws) {
     return 0;
 }
 
-static Node *nextleaf(int mi, Node *cur) {
-    Node *tree = mon_tree(mi);
-    if (!cur || !tree) return firstleaf(tree);
-    Node *n = cur;
-    while (n->par) {
-        if (n->par->a == n) {
-            Node *r = firstleaf(n->par->b);
-            if (r) return r;
-        }
-        n = n->par;
+static void collect_focusables(int mi, Node **list, int *count, int maxcount) {
+    collect_leaves(mon_tree(mi), list, count, maxcount);
+    for (Node *n = mon_floating_at(mi, curws); n && *count < maxcount; n = n->next) {
+        list[(*count)++] = n;
     }
-    return firstleaf(tree);
+}
+
+static Node *nextleaf(int mi, Node *cur) {
+    Node *nodes[256];
+    int count = 0;
+    collect_focusables(mi, nodes, &count, 256);
+    if (!count) return NULL;
+    if (!cur) return nodes[0];
+    for (int i = 0; i < count; i++) {
+        if (nodes[i] == cur) return nodes[(i + 1) % count];
+    }
+    return nodes[0];
 }
 
 static Node *prevleaf(int mi, Node *cur) {
-    Node *tree = mon_tree(mi);
-    Node *prev = NULL;
-    Node *n;
-    if (!tree) return NULL;
-    if (!cur) {
-        n = firstleaf(tree);
-        if (!n) return NULL;
-        while ((n = nextleaf(mi, n)) && n != firstleaf(tree)) prev = n;
-        return prev ? prev : firstleaf(tree);
+    Node *nodes[256];
+    int count = 0;
+    collect_focusables(mi, nodes, &count, 256);
+    if (!count) return NULL;
+    if (!cur) return nodes[count - 1];
+    for (int i = 0; i < count; i++) {
+        if (nodes[i] == cur) return nodes[(i + count - 1) % count];
     }
-    n = firstleaf(tree);
-    while (n) {
-        if (n == cur) break;
-        prev = n;
-        n = nextleaf(mi, n);
-        if (n == firstleaf(tree)) break;
-    }
-    if (prev) return prev;
-    n = firstleaf(tree);
-    prev = n;
-    while ((n = nextleaf(mi, prev)) && n != firstleaf(tree)) prev = n;
-    return prev;
+    return nodes[count - 1];
 }
 
 static void swap_leaf_payload(Node *a, Node *b) {
@@ -457,21 +504,20 @@ static void swap_leaf_payload(Node *a, Node *b) {
     fstmp = a->fullscreen;
     a->fullscreen = b->fullscreen;
     b->fullscreen = fstmp;
+    fstmp = a->real_fullscreen;
+    a->real_fullscreen = b->real_fullscreen;
+    b->real_fullscreen = fstmp;
 }
 
 static void drawborder(Node *n, int focused) {
-    XSetWindowBorderWidth(dpy, n->win, bw);
+    XSetWindowBorderWidth(dpy, n->win, n->real_fullscreen ? 0 : bw);
     XSetWindowBorder(dpy, n->win, focused ? cfocus : cnorm);
 }
 
 static void raise_floating(Node *n) {
-    if (!n) return;
-    if (n->leaf) {
-        if (n->floating) XRaiseWindow(dpy, n->win);
-        return;
+    for (; n; n = n->next) {
+        XRaiseWindow(dpy, n->win);
     }
-    raise_floating(n->a);
-    raise_floating(n->b);
 }
 
 static void show_only_leaf(Node *n, Node *target) {
@@ -493,9 +539,9 @@ static void tilenode(Node *n, int x, int y, int w, int h, Node *foc) {
     n->h = h;
     if (n->leaf) {
         drawborder(n, n == foc);
-        if (n->fullscreen) {
+        if (n->fullscreen || n->real_fullscreen) {
             XMoveResizeWindow(dpy, n->win, x, y, w - 2 * bw, h - 2 * bw);
-        } else if (!n->floating) {
+        } else {
             int tw = w - 2 * gap - 2 * bw;
             int th = h - 2 * gap - 2 * bw;
             if (tw < 1) tw = 1;
@@ -650,7 +696,7 @@ static void drawbars_if_clock_changed(void) {
 
 static void drawbars(void) {
     for (int i = 0; i < nmons; i++) drawbar(i);
-    XSync(dpy, 0);
+    XFlush(dpy);
 }
 
 static void retile(void) {
@@ -660,14 +706,21 @@ static void retile(void) {
         if (fs) {
             show_only_leaf(mon_tree(i), fs);
             drawborder(fs, fs == mon_focused(i));
-            XMoveResizeWindow(dpy, fs->win, m->wx, m->wy, m->ww - 2 * bw, m->wh - 2 * bw);
+            if (fs->real_fullscreen) {
+                if (m->barwin) XUnmapWindow(dpy, m->barwin);
+                XMoveResizeWindow(dpy, fs->win, m->x, m->y, m->w, m->h);
+            } else {
+                if (m->barwin) XMapRaised(dpy, m->barwin);
+                XMoveResizeWindow(dpy, fs->win, m->wx, m->wy, m->ww - 2 * bw, m->wh - 2 * bw);
+            }
             XRaiseWindow(dpy, fs->win);
         } else {
+            if (m->barwin) XMapRaised(dpy, m->barwin);
             showtree(mon_tree(i));
             tilenode(mon_tree(i), m->wx, m->wy, m->ww, m->wh, mon_focused(i));
-            raise_floating(mon_tree(i));
+            raise_floating(mon_floating_at(i, curws));
         }
-        if (m->barwin) XRaiseWindow(dpy, m->barwin);
+        if (m->barwin && !find_real_fullscreen_leaf(mon_tree(i))) XRaiseWindow(dpy, m->barwin);
     }
     drawbars();
 }
@@ -686,8 +739,8 @@ static void setfocus(int mi, Node *n, int warp) {
     if (mode == MODE_INSERT) XSetInputFocus(dpy, n->win, RevertToPointerRoot, CurrentTime);
     XRaiseWindow(dpy, n->win);
     drawborder(n, 1);
-    raise_floating(mon_tree(mi));
-    if (mons[mi].barwin) XRaiseWindow(dpy, mons[mi].barwin);
+    raise_floating(mon_floating_at(mi, curws));
+    if (mons[mi].barwin && !find_real_fullscreen_leaf(mon_tree(mi))) XRaiseWindow(dpy, mons[mi].barwin);
     if (warp) warpfocus(n);
 }
 
@@ -711,11 +764,25 @@ static void hidetree(Node *n) {
     hidetree(n->b);
 }
 
+static void showfloating(Node *n) {
+    for (; n; n = n->next) XMapRaised(dpy, n->win);
+}
+
+static void hidefloating(Node *n) {
+    for (; n; n = n->next) XUnmapWindow(dpy, n->win);
+}
+
 static void switch_workspace(int ws) {
     if (ws < 0 || ws >= MAXWS || ws == curws) return;
-    for (int i = 0; i < nmons; i++) hidetree(mons[i].tree[curws]);
+    for (int i = 0; i < nmons; i++) {
+        hidetree(mons[i].tree[curws]);
+        hidefloating(mons[i].floating[curws]);
+    }
     curws = ws;
-    for (int i = 0; i < nmons; i++) showtree(mons[i].tree[curws]);
+    for (int i = 0; i < nmons; i++) {
+        showtree(mons[i].tree[curws]);
+        showfloating(mons[i].floating[curws]);
+    }
     retile();
     if (mon_focused(curmon)) setfocus(curmon, mon_focused(curmon), 1);
 }
@@ -747,6 +814,17 @@ static void attach_to_ws(int mi, int ws, Node *leaf) {
 
 static void attach(int mi, Node *leaf) { attach_to_ws(mi, curws, leaf); }
 
+static void attach_floating_to_ws(int mi, int ws, Node *leaf) {
+    leaf->floating = 1;
+    leaf->fullscreen = 0;
+    leaf->par = NULL;
+    leaf->next = mon_floating_at(mi, ws);
+    mon_setfloating_at(mi, ws, leaf);
+    mon_setfocused_at(mi, ws, leaf);
+}
+
+static void attach_floating(int mi, Node *leaf) { attach_floating_to_ws(mi, curws, leaf); }
+
 static void insert(int mi, Window w) { attach(mi, mkleaf(w)); }
 
 static void detach_from_ws(int mi, int ws, Node *n) {
@@ -767,15 +845,32 @@ static void detach_from_ws(int mi, int ws, Node *n) {
 
 static void detach(int mi, Node *n) { detach_from_ws(mi, curws, n); }
 
+static void detach_floating_from_ws(int mi, int ws, Node *n) {
+    Node **pp = &mons[mi].floating[ws];
+    while (*pp && *pp != n) pp = &(*pp)->next;
+    if (!*pp) return;
+    *pp = n->next;
+    n->next = NULL;
+    n->floating = 0;
+    if (mon_focused_at(mi, ws) == n) {
+        Node *fallback = mon_floating_at(mi, ws);
+        if (!fallback) fallback = firstleaf(mon_tree_at(mi, ws));
+        mon_setfocused_at(mi, ws, fallback);
+    }
+}
+
+static void detach_floating(int mi, Node *n) { detach_floating_from_ws(mi, curws, n); }
+
 static void removewin(Window w) {
     int mi = monforwin(w);
-    Node *n = findleaf(mon_tree(mi), w);
+    Node *n = findnode(mi, w);
     if (!n) return;
     if (drag_node == n) {
         drag_node = NULL;
         drag_mode = 0;
     }
-    detach(mi, n);
+    if (n->floating) detach_floating(mi, n);
+    else detach(mi, n);
     free(n);
 }
 
@@ -804,6 +899,9 @@ static Node *find_directional_focus(int mi, Node *from, const char *dir) {
 
     if (!from) return NULL;
     collect_leaves(mon_tree(mi), nodes, &count, 256);
+    for (Node *f = mon_floating_at(mi, curws); f && count < 256; f = f->next) {
+        nodes[count++] = f;
+    }
     fx1 = from->x;
     fy1 = from->y;
     fx2 = from->x + from->w;
@@ -858,9 +956,15 @@ static void move_focused_to_workspace(int targetws) {
     if (targetws < 0 || targetws >= MAXWS || targetws == curws) return;
     n = mon_focused(srcmon);
     if (!n) return;
-    detach_from_ws(srcmon, curws, n);
-    attach_to_ws(srcmon, targetws, n);
-    hidetree(n);
+    if (n->floating) {
+        detach_floating_from_ws(srcmon, curws, n);
+        attach_floating_to_ws(srcmon, targetws, n);
+        XUnmapWindow(dpy, n->win);
+    } else {
+        detach_from_ws(srcmon, curws, n);
+        attach_to_ws(srcmon, targetws, n);
+        hidetree(n);
+    }
     retile();
     if (mon_focused(curmon)) setfocus(curmon, mon_focused(curmon), 1);
 }
@@ -1077,14 +1181,121 @@ static void run_autostart(void) {
 }
 
 static void set_net_wm_state(Window win, int fullscreen) {
-    Atom state = XInternAtom(dpy, "_NET_WM_STATE", False);
-    Atom fs = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
     if (fullscreen) {
-        Atom atoms[1] = { fs };
-        XChangeProperty(dpy, win, state, XA_ATOM, 32, PropModeReplace, (unsigned char *)atoms, 1);
+        Atom atoms[1] = { atom_net_wm_state_fullscreen };
+        XChangeProperty(dpy, win, atom_net_wm_state, XA_ATOM, 32, PropModeReplace,
+            (unsigned char *)atoms, 1);
     } else {
-        XDeleteProperty(dpy, win, state);
+        XDeleteProperty(dpy, win, atom_net_wm_state);
     }
+}
+
+static int window_wants_fullscreen(Window win) {
+    Atom actual;
+    int format;
+    unsigned long nitems, bytes_after;
+    unsigned char *data = NULL;
+    int wants = 0;
+
+    if (XGetWindowProperty(dpy, win, atom_net_wm_state, 0, 32, False, XA_ATOM, &actual,
+            &format, &nitems, &bytes_after, &data) == Success && data) {
+        Atom *atoms = (Atom *)data;
+        for (unsigned long i = 0; i < nitems; i++) {
+            if (atoms[i] == atom_net_wm_state_fullscreen) {
+                wants = 1;
+                break;
+            }
+        }
+        XFree(data);
+    }
+    return wants;
+}
+
+static void sync_window_fullscreen(Window win) {
+    int mi = 0, ws = 0;
+    Node *n = findnode_any(win, &mi, &ws);
+    if (!n) return;
+
+    int want = window_wants_fullscreen(win);
+    if (want && n->floating) {
+        detach_floating_from_ws(mi, ws, n);
+        int oldws = curws;
+        curws = ws;
+        attach_to_ws(mi, ws, n);
+        curws = oldws;
+    }
+    if (n->real_fullscreen == want) return;
+    n->real_fullscreen = want;
+    if (want) n->fullscreen = 0;
+    set_net_wm_state(n->win, want);
+    retile();
+    if (ws == curws && mon_focused(mi) == n) XRaiseWindow(dpy, n->win);
+}
+
+static void handle_client_fullscreen(Window win, long action, Atom first, Atom second) {
+    int requested = 0;
+    int mi = 0, ws = 0;
+    Node *n;
+
+    if (first != atom_net_wm_state_fullscreen && second != atom_net_wm_state_fullscreen) return;
+    n = findnode_any(win, &mi, &ws);
+    if (!n) return;
+
+    if (action == 0) requested = 0;
+    else if (action == 1) requested = 1;
+    else if (action == 2) requested = !n->real_fullscreen;
+    else return;
+
+    if (requested && n->floating) {
+        detach_floating_from_ws(mi, ws, n);
+        {
+            int oldws = curws;
+            curws = ws;
+            attach_to_ws(mi, ws, n);
+            curws = oldws;
+        }
+    }
+
+    n->real_fullscreen = requested;
+    if (requested) n->fullscreen = 0;
+    set_net_wm_state(win, requested);
+    retile();
+    if (ws == curws) {
+        mon_setfocused_at(mi, ws, n);
+        if (mode == MODE_INSERT) setfocus(mi, n, 0);
+        else XRaiseWindow(dpy, n->win);
+    }
+}
+
+static void initatoms(void) {
+    atom_net_supported = XInternAtom(dpy, "_NET_SUPPORTED", False);
+    atom_net_supporting_wm_check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
+    atom_utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
+    atom_net_wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
+    atom_net_wm_state_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+}
+
+static void setup_wm_check(void) {
+    static const char name[] = "viwm";
+    Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+    wmcheckwin = XCreateSimpleWindow(dpy, root, -1, -1, 1, 1, 0, 0, 0);
+    XChangeProperty(dpy, wmcheckwin, atom_net_supporting_wm_check, XA_WINDOW, 32,
+        PropModeReplace, (unsigned char *)&wmcheckwin, 1);
+    XChangeProperty(dpy, root, atom_net_supporting_wm_check, XA_WINDOW, 32,
+        PropModeReplace, (unsigned char *)&wmcheckwin, 1);
+    XChangeProperty(dpy, wmcheckwin, net_wm_name, atom_utf8_string, 8,
+        PropModeReplace, (const unsigned char *)name, (int)strlen(name));
+}
+
+static void update_supported_atoms(void) {
+    Atom supported[] = {
+        atom_net_supported,
+        atom_net_supporting_wm_check,
+        atom_net_wm_state,
+        atom_net_wm_state_fullscreen,
+    };
+    XChangeProperty(dpy, root, atom_net_supported, XA_ATOM, 32, PropModeReplace,
+        (unsigned char *)supported, (int)(sizeof supported / sizeof supported[0]));
 }
 
 static void enter_mode(InputMode newmode) {
@@ -1218,23 +1429,35 @@ static int apply_wm_action(const char *action) {
     }
     if (!strcmp(action, "wm:toggle_float")) {
         if (!mon_focused(curmon)) return 1;
-        mon_focused(curmon)->floating ^= 1;
         if (mon_focused(curmon)->floating) {
+            Node *n = mon_focused(curmon);
+            detach_floating(curmon, n);
+            attach(curmon, n);
+            setfocus(curmon, n, 0);
+        } else {
+            Node *n = mon_focused(curmon);
             int fw = m->ww / 2;
             int fh = m->wh / 2;
             int fx = m->wx + (m->ww - fw) / 2;
             int fy = m->wy + (m->wh - fh) / 2;
-            XMoveResizeWindow(dpy, mon_focused(curmon)->win, fx, fy, fw - 2 * bw, fh - 2 * bw);
-            XRaiseWindow(dpy, mon_focused(curmon)->win);
+            detach(curmon, n);
+            attach_floating(curmon, n);
+            XMoveResizeWindow(dpy, n->win, fx, fy, fw - 2 * bw, fh - 2 * bw);
+            XRaiseWindow(dpy, n->win);
         }
         retile();
         return 1;
     }
     if (!strcmp(action, "wm:toggle_fullscreen")) {
         if (!mon_focused(curmon)) return 1;
+        if (mon_focused(curmon)->floating) {
+            Node *n = mon_focused(curmon);
+            detach_floating(curmon, n);
+            attach(curmon, n);
+            setfocus(curmon, n, 0);
+        }
         mon_focused(curmon)->fullscreen ^= 1;
-        if (mon_focused(curmon)->fullscreen) mon_focused(curmon)->floating = 0;
-        set_net_wm_state(mon_focused(curmon)->win, mon_focused(curmon)->fullscreen);
+        if (mon_focused(curmon)->fullscreen) mon_focused(curmon)->real_fullscreen = 0;
         retile();
         XRaiseWindow(dpy, mon_focused(curmon)->win);
         return 1;
@@ -1371,6 +1594,9 @@ int main(void) {
     sh = DisplayHeight(dpy, scr);
     normalcursor = XCreateFontCursor(dpy, XC_left_ptr);
     XDefineCursor(dpy, root, normalcursor);
+    initatoms();
+    setup_wm_check();
+    update_supported_atoms();
 
     int xiev, xierr;
     if (XineramaQueryExtension(dpy, &xiev, &xierr) && XineramaIsActive(dpy)) {
@@ -1422,7 +1648,7 @@ int main(void) {
             break;
 
         case MapRequest:
-            XSelectInput(dpy, ev.xmaprequest.window, EnterWindowMask);
+            XSelectInput(dpy, ev.xmaprequest.window, EnterWindowMask | PropertyChangeMask);
             XMapWindow(dpy, ev.xmaprequest.window);
             {
                 Window dw;
@@ -1431,8 +1657,22 @@ int main(void) {
                 XQueryPointer(dpy, root, &dw, &dw, &rx, &ry, &wx, &wy, &msk);
                 int mi = monforpt(rx, ry);
                 insert(mi, ev.xmaprequest.window);
+                sync_window_fullscreen(ev.xmaprequest.window);
                 retile();
                 setfocus(mi, mon_focused(mi), 1);
+            }
+            break;
+
+        case PropertyNotify:
+            if (ev.xproperty.atom == atom_net_wm_state) {
+                sync_window_fullscreen(ev.xproperty.window);
+            }
+            break;
+
+        case ClientMessage:
+            if (ev.xclient.message_type == atom_net_wm_state) {
+                handle_client_fullscreen(ev.xclient.window, ev.xclient.data.l[0],
+                    (Atom)ev.xclient.data.l[1], (Atom)ev.xclient.data.l[2]);
             }
             break;
 
@@ -1469,7 +1709,7 @@ int main(void) {
             if (mode != MODE_INSERT) break;
             if (ev.xcrossing.mode == NotifyNormal) {
                 int mi = monforwin(ev.xcrossing.window);
-                Node *n = findleaf(mon_tree(mi), ev.xcrossing.window);
+                Node *n = findnode(mi, ev.xcrossing.window);
                 if (n && n != mon_focused(mi)) setfocus(mi, n, 0);
             }
             break;
@@ -1484,7 +1724,7 @@ int main(void) {
             int mi = monforpt(ev.xbutton.x_root, ev.xbutton.y_root);
             Node *n = NULL;
             for (int i = 0; i < nmons && !n; i++) {
-                if ((n = findleaf(mon_tree(i), clicked))) mi = i;
+                if ((n = findnode(i, clicked))) mi = i;
             }
 
             if (n && n->floating) {
@@ -1492,7 +1732,7 @@ int main(void) {
                 if (n != mon_focused(mi)) setfocus(mi, n, 1);
                 else {
                     XRaiseWindow(dpy, n->win);
-                    raise_floating(mon_tree(mi));
+                    raise_floating(mon_floating_at(mi, curws));
                 }
 
                 Window dw;
@@ -1530,10 +1770,8 @@ int main(void) {
                     XQueryPointer(dpy, root, &dw, &dw, &rx, &ry, &wx2, &wy2, &msk);
                     int newmon = monforpt(rx, ry);
                     if (newmon != drag_mon) {
-                        int was_floating = drag_node->floating;
-                        detach(drag_mon, drag_node);
-                        attach(newmon, drag_node);
-                        drag_node->floating = was_floating;
+                        detach_floating(drag_mon, drag_node);
+                        attach_floating(newmon, drag_node);
                         curmon = newmon;
                         retile();
                     }
