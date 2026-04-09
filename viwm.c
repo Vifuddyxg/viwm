@@ -130,6 +130,7 @@ static void drawbars(void);
 static void update_clock(void);
 static void update_battery(void);
 static void setupbars(void);
+static void enter_mode(InputMode newmode);
 static Node *mon_focused(int mi);
 static void showtree(Node *n);
 static void collect_leaves(Node *n, Node **list, int *count, int maxcount);
@@ -520,6 +521,14 @@ static void raise_floating(Node *n) {
     }
 }
 
+static int monitor_has_real_fullscreen(int mi) {
+    return find_real_fullscreen_leaf(mon_tree(mi)) != NULL;
+}
+
+static void raise_bar_if_needed(int mi) {
+    if (mons[mi].barwin && !monitor_has_real_fullscreen(mi)) XRaiseWindow(dpy, mons[mi].barwin);
+}
+
 static void show_only_leaf(Node *n, Node *target) {
     if (!n) return;
     if (n->leaf) {
@@ -574,38 +583,128 @@ static int draw_tag_box(Window win, int x, int y, const char *text,
     return w;
 }
 
+static int workspace_tag_width(int ws) {
+    char part[8];
+    snprintf(part, sizeof part, "%d", ws + 1);
+    return textw(part) + 16;
+}
+
+static int boxed_text_width(const char *text, int minw) {
+    int w;
+    if (!text || !text[0]) return 0;
+    w = textw(text) + 16;
+    return w < minw ? minw : w;
+}
+
+static int workspace_section_width(void) {
+    int width = 0;
+    for (int i = 0; i < MAXWS; i++) {
+        if (!workspace_has_windows(i) && i != curws) continue;
+        width += workspace_tag_width(i) + 6;
+    }
+    return width > 0 ? width - 6 : 0;
+}
+
+static int draw_workspace_section(Window win, int x, int y) {
+    int curx = x;
+    for (int i = 0; i < MAXWS; i++) {
+        char part[8];
+        unsigned long bg = barbg, fg = barmutedfg;
+        if (!workspace_has_windows(i) && i != curws) continue;
+        snprintf(part, sizeof part, "%d", i + 1);
+        if (i == curws) {
+            bg = cnorm;
+            fg = barfg;
+        } else if (workspace_has_windows(i)) {
+            bg = barbg;
+            fg = barfg;
+        }
+        curx += draw_tag_box(win, curx, y, part, bg, fg, 20);
+        curx += 6;
+    }
+    return curx;
+}
+
+static int section_item_width(const char *item) {
+    char tmp[256];
+    int width = 0;
+
+    tmp[0] = 0;
+    if (!strcasecmp(item, "workspaces")) return workspace_section_width();
+    if (!strcasecmp(item, "command")) {
+        build_mode_text(tmp, sizeof tmp);
+        width = boxed_text_width(tmp, 0);
+        if (mode == MODE_COMMAND && cmdline_len > 0) width += 6 + boxed_text_width(cmdline, 0);
+        return width;
+    }
+    if (!strcasecmp(item, "title")) {
+        build_title_text(tmp, sizeof tmp);
+        return boxed_text_width(tmp, 0);
+    }
+    if (!strcasecmp(item, "clock")) {
+        build_clock_text(tmp, sizeof tmp);
+        return boxed_text_width(tmp, 0);
+    }
+    if (!strcasecmp(item, "battery")) {
+        build_battery_text(tmp, sizeof tmp);
+        return boxed_text_width(tmp, 0);
+    }
+    if (!strcasecmp(item, "mode")) {
+        build_mode_text(tmp, sizeof tmp);
+        return boxed_text_width(tmp, 0);
+    }
+    return 0;
+}
+
+static int draw_section_item(Window win, int x, int y, const char *item) {
+    char tmp[256];
+    int curx = x;
+
+    tmp[0] = 0;
+    if (!strcasecmp(item, "workspaces")) return draw_workspace_section(win, x, y);
+    if (!strcasecmp(item, "command")) {
+        build_mode_text(tmp, sizeof tmp);
+        curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
+        if (mode == MODE_COMMAND && cmdline_len > 0) {
+            curx += 6;
+            curx += draw_tag_box(win, curx, y, cmdline, cnorm, barfg, 0);
+        }
+        return curx;
+    }
+    if (!strcasecmp(item, "title")) {
+        build_title_text(tmp, sizeof tmp);
+        if (tmp[0]) curx += draw_tag_box(win, curx, y, tmp, barbg, barfg, 0);
+        return curx;
+    }
+    if (!strcasecmp(item, "clock")) {
+        build_clock_text(tmp, sizeof tmp);
+        curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
+        return curx;
+    }
+    if (!strcasecmp(item, "battery")) {
+        build_battery_text(tmp, sizeof tmp);
+        if (tmp[0]) curx += draw_tag_box(win, curx, y, tmp, cnorm, barfg, 0);
+        return curx;
+    }
+    if (!strcasecmp(item, "mode")) {
+        build_mode_text(tmp, sizeof tmp);
+        curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
+        return curx;
+    }
+    return curx;
+}
+
 static int section_width(const char *cfg) {
     char buf[128], *tok, *save;
     int width = 0;
     copystr(buf, sizeof buf, cfg);
     for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        char item[128], tmp[256];
+        char item[128];
         copystr(item, sizeof item, ltrim(tok));
         rtrim(item);
-        tmp[0] = 0;
-        if (!strcasecmp(item, "workspaces")) {
-            for (int i = 0; i < MAXWS; i++) {
-                char part[8];
-                if (!workspace_has_windows(i) && i != curws) continue;
-                snprintf(part, sizeof part, "%d", i + 1);
-                width += (textw(part) + 16) + 6;
-            }
-        } else if (!strcasecmp(item, "command")) {
-            build_mode_text(tmp, sizeof tmp);
-            width += textw(tmp) + 16;
-            if (mode == MODE_COMMAND && cmdline_len > 0) width += 6 + textw(cmdline) + 16;
-        } else if (!strcasecmp(item, "title")) {
-            build_title_text(tmp, sizeof tmp);
-            if (tmp[0]) width += textw(tmp) + 16;
-        } else if (!strcasecmp(item, "clock")) {
-            build_clock_text(tmp, sizeof tmp);
-            width += textw(tmp) + 16;
-        } else if (!strcasecmp(item, "battery")) {
-            build_battery_text(tmp, sizeof tmp);
-            if (tmp[0]) width += textw(tmp) + 16;
-        } else if (!strcasecmp(item, "mode")) {
-            build_mode_text(tmp, sizeof tmp);
-            width += textw(tmp) + 16;
+        {
+            int itemw = section_item_width(item);
+            if (itemw > 0) width += itemw + 6;
         }
     }
     return width > 0 ? width - 6 : 0;
@@ -616,53 +715,15 @@ static int draw_section(Window win, int x, int y, const char *cfg) {
     int curx = x;
     copystr(buf, sizeof buf, cfg);
     for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        char item[128], tmp[256];
+        char item[128];
         copystr(item, sizeof item, ltrim(tok));
         rtrim(item);
-        if (!strcasecmp(item, "workspaces")) {
-            for (int i = 0; i < MAXWS; i++) {
-                char part[8];
-                unsigned long bg = barbg, fg = barmutedfg;
-                if (!workspace_has_windows(i) && i != curws) continue;
-                snprintf(part, sizeof part, "%d", i + 1);
-                if (i == curws) {
-                    bg = cnorm;
-                    fg = barfg;
-                } else if (workspace_has_windows(i)) {
-                    bg = barbg;
-                    fg = barfg;
-                }
-                curx += draw_tag_box(win, curx, y, part, bg, fg, 20);
+        {
+            int nextx = draw_section_item(win, curx, y, item);
+            if (nextx != curx) {
+                curx = nextx;
                 curx += 6;
             }
-        } else if (!strcasecmp(item, "command")) {
-            build_mode_text(tmp, sizeof tmp);
-            curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
-            if (mode == MODE_COMMAND && cmdline_len > 0) {
-                curx += 6;
-                curx += draw_tag_box(win, curx, y, cmdline, cnorm, barfg, 0);
-            }
-            curx += 6;
-        } else if (!strcasecmp(item, "title")) {
-            build_title_text(tmp, sizeof tmp);
-            if (tmp[0]) {
-                curx += draw_tag_box(win, curx, y, tmp, barbg, barfg, 0);
-                curx += 6;
-            }
-        } else if (!strcasecmp(item, "clock")) {
-            build_clock_text(tmp, sizeof tmp);
-            curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
-            curx += 6;
-        } else if (!strcasecmp(item, "battery")) {
-            build_battery_text(tmp, sizeof tmp);
-            if (tmp[0]) {
-                curx += draw_tag_box(win, curx, y, tmp, cnorm, barfg, 0);
-                curx += 6;
-            }
-        } else if (!strcasecmp(item, "mode")) {
-            build_mode_text(tmp, sizeof tmp);
-            curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
-            curx += 6;
         }
     }
     return curx;
@@ -670,9 +731,10 @@ static int draw_section(Window win, int x, int y, const char *cfg) {
 
 static void drawbar(int mi) {
     if (!mons[mi].barwin) return;
-    int leftx = 10, centx, rightx;
+    int leftx = 10, leftw, centx, rightx;
     int centerw = section_width(barcentercfg);
     int rightw = section_width(barrightcfg);
+    leftw = section_width(barleftcfg);
 
     XSetForeground(dpy, bargc, barbg);
     XFillRectangle(dpy, mons[mi].barwin, bargc, 0, 0, mons[mi].w, barh);
@@ -681,13 +743,18 @@ static void drawbar(int mi) {
     rightx = mons[mi].w - rightw - 10;
     if (rightw > 0) draw_section(mons[mi].barwin, rightx, 0, barrightcfg);
     centx = (mons[mi].w - centerw) / 2;
-    if (centerw > 0 && centx > leftx + section_width(barleftcfg) + 12 && centx + centerw < rightx - 12)
+    if (centerw > 0 && centx > leftx + leftw + 12 && centx + centerw < rightx - 12)
         draw_section(mons[mi].barwin, centx, 0, barcentercfg);
+}
+
+static int bar_uses_item(const char *item) {
+    return strstr(barleftcfg, item) || strstr(barcentercfg, item) || strstr(barrightcfg, item);
 }
 
 static void drawbars_if_clock_changed(void) {
     time_t now = time(NULL);
     struct tm tm_now;
+    if (!bar_uses_item("clock") && !bar_uses_item("battery")) return;
     localtime_r(&now, &tm_now);
     if (tm_now.tm_sec != last_clock_second) {
         drawbars();
@@ -720,7 +787,7 @@ static void retile(void) {
             tilenode(mon_tree(i), m->wx, m->wy, m->ww, m->wh, mon_focused(i));
             raise_floating(mon_floating_at(i, curws));
         }
-        if (m->barwin && !find_real_fullscreen_leaf(mon_tree(i))) XRaiseWindow(dpy, m->barwin);
+        raise_bar_if_needed(i);
     }
     drawbars();
 }
@@ -740,7 +807,7 @@ static void setfocus(int mi, Node *n, int warp) {
     XRaiseWindow(dpy, n->win);
     drawborder(n, 1);
     raise_floating(mon_floating_at(mi, curws));
-    if (mons[mi].barwin && !find_real_fullscreen_leaf(mon_tree(mi))) XRaiseWindow(dpy, mons[mi].barwin);
+    raise_bar_if_needed(mi);
     if (warp) warpfocus(n);
 }
 
@@ -996,6 +1063,44 @@ static void spawn(const char *cmd) {
     }
 }
 
+static void start_command_prompt(char prefix) {
+    cmdline[0] = prefix;
+    cmdline[1] = 0;
+    cmdline_len = 1;
+    enter_mode(MODE_COMMAND);
+}
+
+static void shell_quote_single(char *dst, size_t dstsz, const char *src) {
+    size_t pos = 0;
+    if (!dstsz) return;
+    dst[0] = 0;
+    if (pos + 1 < dstsz) dst[pos++] = '\'';
+    for (; *src && pos + 1 < dstsz; src++) {
+        if (*src == '\'') {
+            static const char repl[] = "'\\''";
+            for (size_t i = 0; repl[i] && pos + 1 < dstsz; i++) dst[pos++] = repl[i];
+        } else {
+            dst[pos++] = *src;
+        }
+    }
+    if (pos + 1 < dstsz) dst[pos++] = '\'';
+    dst[pos] = 0;
+}
+
+static void spawn_in_terminal(const char *cmd) {
+    char quoted[CMDLINE_MAX * 4];
+    char full[CMDLINE_MAX * 4 + 256];
+
+    if (!cmd || !*cmd) {
+        spawn(term);
+        return;
+    }
+
+    shell_quote_single(quoted, sizeof quoted, cmd);
+    snprintf(full, sizeof full, "%s -e sh -lc %s", term, quoted);
+    spawn(full);
+}
+
 static int parse_mods(const char *keys) {
     int mask = 0;
     if (strstr(keys, "mod")) mask |= Mod4Mask;
@@ -1061,6 +1166,46 @@ static void grab_mod_binds(void) {
     }
 }
 
+static void add_insert_bind(const char *keyexpr, const char *action) {
+    char *kp;
+    KeySym sym;
+    KeyCode code;
+
+    if (nmodbinds >= modbind_limit) return;
+    kp = strrchr(keyexpr, '+');
+    kp = kp ? kp + 1 : (char *)keyexpr;
+    kp = ltrim(kp);
+    if (!*kp) return;
+
+    sym = parse_keysym_name(kp);
+    if (sym == NoSymbol) return;
+    code = XKeysymToKeycode(dpy, sym);
+    if (!code) return;
+
+    modbinds[nmodbinds].mod = parse_mods(keyexpr);
+    modbinds[nmodbinds].code = code;
+    copystr(modbinds[nmodbinds].action, sizeof modbinds[nmodbinds].action, action);
+    nmodbinds++;
+}
+
+static void add_normal_bind(const char *keyexpr, const char *action) {
+    KeySym sym;
+    if (nnormalbinds >= normalbind_limit) return;
+    sym = parse_keysym_name(keyexpr);
+    if (sym == NoSymbol) return;
+    normalbinds[nnormalbinds].sym = sym;
+    copystr(normalbinds[nnormalbinds].action, sizeof normalbinds[nnormalbinds].action, action);
+    nnormalbinds++;
+}
+
+static void add_command_bind(const char *name, const char *action) {
+    if (ncmdbinds >= cmd_limit) return;
+    copystr(cmdbinds[ncmdbinds].name, sizeof cmdbinds[ncmdbinds].name,
+        skip_command_prefix(name));
+    copystr(cmdbinds[ncmdbinds].action, sizeof cmdbinds[ncmdbinds].action, action);
+    ncmdbinds++;
+}
+
 static void loadcfg(void) {
     const char *cfgpaths[] = {
         "/etc/viwm/config.conf",
@@ -1082,41 +1227,14 @@ static void loadcfg(void) {
                 rtrim(mode_name);
                 rtrim(keyexpr);
                 rtrim(action);
-                if (!strcasecmp(mode_name, "insert") && nmodbinds < modbind_limit) {
-                    char *kp = strrchr(keyexpr, '+');
-                    kp = kp ? kp + 1 : keyexpr;
-                    kp = ltrim(kp);
-                    if (*kp) {
-                        KeySym sym = parse_keysym_name(kp);
-                        if (sym != NoSymbol) {
-                            KeyCode code = XKeysymToKeycode(dpy, sym);
-                            if (code) {
-                                modbinds[nmodbinds].mod = parse_mods(keyexpr);
-                                modbinds[nmodbinds].code = code;
-                                copystr(modbinds[nmodbinds].action, sizeof modbinds[nmodbinds].action, action);
-                                nmodbinds++;
-                            }
-                        }
-                    }
-                } else if (!strcasecmp(mode_name, "normal") && nnormalbinds < normalbind_limit) {
-                    KeySym sym = parse_keysym_name(keyexpr);
-                    if (sym != NoSymbol) {
-                        normalbinds[nnormalbinds].sym = sym;
-                        copystr(normalbinds[nnormalbinds].action, sizeof normalbinds[nnormalbinds].action, action);
-                        nnormalbinds++;
-                    }
-                }
+                if (!strcasecmp(mode_name, "insert")) add_insert_bind(keyexpr, action);
+                else if (!strcasecmp(mode_name, "normal")) add_normal_bind(keyexpr, action);
                 continue;
             }
             if (sscanf(p, "command = %63[^=]= %255[^\n]", cmd_name, cmd_action) == 2) {
                 rtrim(cmd_name);
                 rtrim(cmd_action);
-                if (ncmdbinds < cmd_limit) {
-                    copystr(cmdbinds[ncmdbinds].name, sizeof cmdbinds[ncmdbinds].name,
-                        skip_command_prefix(cmd_name));
-                    copystr(cmdbinds[ncmdbinds].action, sizeof cmdbinds[ncmdbinds].action, cmd_action);
-                    ncmdbinds++;
-                }
+                add_command_bind(cmd_name, cmd_action);
                 continue;
             }
             {
@@ -1211,25 +1329,39 @@ static int window_wants_fullscreen(Window win) {
     return wants;
 }
 
-static void sync_window_fullscreen(Window win) {
-    int mi = 0, ws = 0;
-    Node *n = findnode_any(win, &mi, &ws);
-    if (!n) return;
-
-    int want = window_wants_fullscreen(win);
-    if (want && n->floating) {
-        detach_floating_from_ws(mi, ws, n);
+static void ensure_tiled_for_workspace(int mi, int ws, Node *n) {
+    if (!n || !n->floating) return;
+    detach_floating_from_ws(mi, ws, n);
+    {
         int oldws = curws;
         curws = ws;
         attach_to_ws(mi, ws, n);
         curws = oldws;
     }
+}
+
+static void apply_real_fullscreen(Node *n, Window win, int mi, int ws, int want, int focus_if_visible) {
+    if (!n) return;
+    if (want) {
+        ensure_tiled_for_workspace(mi, ws, n);
+    }
     if (n->real_fullscreen == want) return;
     n->real_fullscreen = want;
     if (want) n->fullscreen = 0;
-    set_net_wm_state(n->win, want);
+    set_net_wm_state(win, want);
     retile();
-    if (ws == curws && mon_focused(mi) == n) XRaiseWindow(dpy, n->win);
+    if (ws == curws) {
+        mon_setfocused_at(mi, ws, n);
+        if (focus_if_visible && mode == MODE_INSERT) setfocus(mi, n, 0);
+        else XRaiseWindow(dpy, n->win);
+    }
+}
+
+static void sync_window_fullscreen(Window win) {
+    int mi = 0, ws = 0;
+    Node *n = findnode_any(win, &mi, &ws);
+    if (!n) return;
+    apply_real_fullscreen(n, n->win, mi, ws, window_wants_fullscreen(win), 0);
 }
 
 static void handle_client_fullscreen(Window win, long action, Atom first, Atom second) {
@@ -1245,26 +1377,7 @@ static void handle_client_fullscreen(Window win, long action, Atom first, Atom s
     else if (action == 1) requested = 1;
     else if (action == 2) requested = !n->real_fullscreen;
     else return;
-
-    if (requested && n->floating) {
-        detach_floating_from_ws(mi, ws, n);
-        {
-            int oldws = curws;
-            curws = ws;
-            attach_to_ws(mi, ws, n);
-            curws = oldws;
-        }
-    }
-
-    n->real_fullscreen = requested;
-    if (requested) n->fullscreen = 0;
-    set_net_wm_state(win, requested);
-    retile();
-    if (ws == curws) {
-        mon_setfocused_at(mi, ws, n);
-        if (mode == MODE_INSERT) setfocus(mi, n, 0);
-        else XRaiseWindow(dpy, n->win);
-    }
+    apply_real_fullscreen(n, win, mi, ws, requested, 1);
 }
 
 static void initatoms(void) {
@@ -1487,16 +1600,37 @@ static int apply_wm_action(const char *action) {
 }
 
 static int run_command_line(void) {
-    if (cmdline_len < 2 || cmdline[0] != ':') {
+    if (cmdline_len < 2 || (cmdline[0] != ':' && cmdline[0] != '/')) {
         enter_mode(MODE_NORMAL);
         return 0;
     }
-    const char *name = cmdline + 1;
-    for (int i = 0; i < ncmdbinds; i++) {
-        if (!strcmp(name, cmdbinds[i].name)) {
-            int keep = apply_wm_action(cmdbinds[i].action);
-            if (mode == MODE_COMMAND) enter_mode(MODE_NORMAL);
-            return keep;
+
+    if (cmdline[0] == '/') {
+        const char *cmd = cmdline + 1;
+        if (*cmd) spawn(cmd);
+        enter_mode(MODE_NORMAL);
+        return 1;
+    }
+
+    {
+        const char *name = cmdline + 1;
+        if (!strncmp(name, "t ", 2)) {
+            while (*name == 't' || *name == ' ') name++;
+            spawn_in_terminal(name);
+            enter_mode(MODE_NORMAL);
+            return 1;
+        }
+        if (!strcmp(name, "t")) {
+            spawn_in_terminal("");
+            enter_mode(MODE_NORMAL);
+            return 1;
+        }
+        for (int i = 0; i < ncmdbinds; i++) {
+            if (!strcmp(name, cmdbinds[i].name)) {
+                int keep = apply_wm_action(cmdbinds[i].action);
+                if (mode == MODE_COMMAND) enter_mode(MODE_NORMAL);
+                return keep;
+            }
         }
     }
     enter_mode(MODE_NORMAL);
@@ -1535,9 +1669,11 @@ static int handle_normal_key(XKeyEvent *kev, KeySym sym) {
     int len = XLookupString(kev, text, sizeof text, NULL, NULL);
 
     if (len > 0 && text[0] == ':') {
-        copystr(cmdline, sizeof cmdline, ":");
-        cmdline_len = 1;
-        enter_mode(MODE_COMMAND);
+        start_command_prompt(':');
+        return 1;
+    }
+    if (len > 0 && text[0] == '/') {
+        start_command_prompt('/');
         return 1;
     }
     if (sym == XK_Escape) {

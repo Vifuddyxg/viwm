@@ -29,7 +29,14 @@ Examples:
 
 ## Build
 
+```sh
+git clone https://github.com/Vifuddyxg/viwm
+cd viwm
 ```
+
+Then build and install:
+
+```sh
 make
 sudo make install
 ```
@@ -142,10 +149,41 @@ Default pattern:
 
 Commands are typed in the bar and executed with `Enter`.
 
-Example:
+There are three useful command entry styles:
 
 ```text
 :q!
+/librewolf
+:t btop
+```
+
+- `:` runs internal VIWM commands
+- `/` runs a shell command directly in the background
+- `:t ...` runs a shell command inside the configured terminal
+
+Examples:
+
+```text
+:q!
+:t htop
+/librewolf
+/./program
+```
+
+You can also map your own command names in `config.conf` so `:something` triggers a specific script or command:
+
+```conf
+command = :lock = spawn:~/.local/bin/lock-screen
+command = :music = spawn:~/.local/bin/music-menu
+command = :browser = spawn:librewolf
+```
+
+Then from `NORMAL` mode you can press `:` and run:
+
+```text
+:lock
+:music
+:browser
 ```
 
 ## Keybinds
@@ -157,6 +195,7 @@ The exact behavior depends on your config, but the default setup includes:
 | `Super+Escape` | Enter `NORMAL` mode |
 | `i` | Return to `INSERT` mode |
 | `:` | Enter `COMMAND` mode |
+| `/` | Enter shell-command mode from `NORMAL` |
 | `Super+1..9` | Switch workspace |
 | `Super+Left/Right` | Focus previous / next window |
 | `Super+Ctrl+Left/Right` | Swap with previous / next window |
