@@ -9,6 +9,7 @@
 #include <X11/keysym.h>
 #include <X11/extensions/Xinerama.h>
 #include <signal.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #define MAXBINDS     48
 #define MAXMODEBINDS 24
 #define MAXCMDS      16
+#define MAXRULES     32
 #define MAXMONS       8
 #define MAXWS         9
 #define MAXAUTOSTART 8
@@ -30,8 +32,9 @@ struct Node {
     int leaf, floating, horiz;
     int fullscreen;
     int real_fullscreen;
+    int ignore_unmap;
     float ratio;
-    Node *a, *b, *par, *next;
+    Node *a, *b, *par;
     Window win;
     int x, y, w, h;
 };
@@ -53,10 +56,18 @@ typedef struct {
 } CmdBind;
 
 typedef struct {
+    char class_name[64];
+    char instance_name[64];
+    char title[128];
+    int set_floating;
+    int floating;
+    int workspace;
+} Rule;
+
+typedef struct {
     int x, y, w, h;
     int wx, wy, ww, wh;
     Node *tree[MAXWS], *focused[MAXWS];
-    Node *floating[MAXWS];
     Window barwin;
 } Mon;
 
@@ -72,6 +83,7 @@ typedef enum {
 } InputMode;
 
 static int gap = 8, bw = 2, barh = 24;
+static int barpadx = 10, baritemgap = 6, bartextpad = 8, barwsminw = 20;
 static unsigned long cfocus = 0x5588ff, cnorm = 0x333333;
 static unsigned long barbg = 0x111111, barfg = 0xeeeeee;
 static unsigned long baraccentbg = 0x5588ff, baraccentfg = 0x111111;
@@ -88,12 +100,15 @@ static int sw, sh;
 static Mon mons[MAXMONS];
 static int nmons = 1, curmon;
 static int curws;
+static Window wmcheckwin;
 static ModBind modbinds[MAXBINDS];
 static int nmodbinds;
 static ModeBind normalbinds[MAXMODEBINDS];
 static int nnormalbinds;
 static CmdBind cmdbinds[MAXCMDS];
 static int ncmdbinds;
+static Rule rules[MAXRULES];
+static int nrules;
 static char autostart_cmds[MAXAUTOSTART][256];
 static int nautostart;
 static int modbind_limit = MAXBINDS;
@@ -103,10 +118,28 @@ static int autostart_limit = MAXAUTOSTART;
 static GC bargc;
 static XFontStruct *barfont;
 static Cursor normalcursor;
+static Cursor movecursor;
+static Cursor resizecursor;
 static InputMode mode = MODE_INSERT;
 static int keyboard_grabbed;
 static int running = 1;
 static unsigned int numlockmask;
+static Atom atom_net_active_window;
+static Atom atom_net_client_list;
+static Atom atom_net_current_desktop;
+static Atom atom_net_number_of_desktops;
+static Atom atom_net_supported;
+static Atom atom_net_supporting_wm_check;
+static Atom atom_utf8_string;
+static Atom atom_net_wm_window_type;
+static Atom atom_net_wm_window_type_dock;
+static Atom atom_net_wm_window_type_dialog;
+static Atom atom_net_wm_window_type_utility;
+static Atom atom_net_wm_window_type_toolbar;
+static Atom atom_net_wm_window_type_splash;
+static Atom atom_net_wm_desktop;
+static Atom atom_net_wm_state;
+static Atom atom_net_wm_state_fullscreen;
 static char cmdline[CMDLINE_MAX];
 static int cmdline_len;
 static char timestr[32];
@@ -118,12 +151,6 @@ static int drag_ox, drag_oy;
 static int drag_wx, drag_wy;
 static int drag_ww, drag_wh;
 static Node *drag_node;
-static Window wmcheckwin;
-static Atom atom_net_wm_state;
-static Atom atom_net_wm_state_fullscreen;
-static Atom atom_net_supported;
-static Atom atom_net_supporting_wm_check;
-static Atom atom_utf8_string;
 
 static int xerr(Display *d, XErrorEvent *e) { (void)d; (void)e; return 0; }
 static void drawbars(void);
@@ -133,10 +160,18 @@ static void setupbars(void);
 static void enter_mode(InputMode newmode);
 static Node *mon_focused(int mi);
 static void showtree(Node *n);
-static void collect_leaves(Node *n, Node **list, int *count, int maxcount);
 static void spawn(const char *cmd);
-static void setup_wm_check(void);
+static void initatoms(void);
+static void apply_rules(Node *n, int *targetws);
+static void update_client_list(void);
+static void update_current_desktop(void);
+static void update_number_of_desktops(void);
+static void update_active_window(void);
+static void set_window_desktop(Window win, int ws);
 static void update_supported_atoms(void);
+static void setup_wm_check(void);
+static void reloadwm(void);
+static void collect_leaves(Node *n, Node **list, int *count, int maxcount);
 static unsigned long hcol(const char *s) {
     return strtoul(*s == '#' ? s + 1 : s, NULL, 16);
 }
@@ -265,6 +300,45 @@ static int get_window_title(Window win, char *dst, size_t dstsz) {
     return 0;
 }
 
+static int get_window_class(Window win, char *class_name, size_t class_sz,
+    char *instance_name, size_t instance_sz)
+{
+    XClassHint hint;
+    class_name[0] = 0;
+    instance_name[0] = 0;
+    if (!XGetClassHint(dpy, win, &hint)) return 0;
+    if (hint.res_class) {
+        copystr(class_name, class_sz, hint.res_class);
+        XFree(hint.res_class);
+    }
+    if (hint.res_name) {
+        copystr(instance_name, instance_sz, hint.res_name);
+        XFree(hint.res_name);
+    }
+    return class_name[0] || instance_name[0];
+}
+
+static int window_has_atom(Window win, Atom prop, Atom value) {
+    Atom actual_type;
+    int actual_format;
+    unsigned long nitems, bytes_after;
+    Atom *atoms = NULL;
+    int found = 0;
+    if (XGetWindowProperty(dpy, win, prop, 0, 32, False, XA_ATOM,
+            &actual_type, &actual_format, &nitems, &bytes_after,
+            (unsigned char **)&atoms) != Success) return 0;
+    if (actual_type == XA_ATOM && actual_format == 32 && atoms) {
+        for (unsigned long i = 0; i < nitems; i++) {
+            if (atoms[i] == value) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    if (atoms) XFree(atoms);
+    return found;
+}
+
 static void build_title_text(char *dst, size_t dstsz) {
     Node *n = mon_focused(curmon);
     dst[0] = 0;
@@ -360,10 +434,6 @@ static Node *mon_focused_at(int mi, int ws) {
     return mons[mi].focused[ws];
 }
 
-static Node *mon_floating_at(int mi, int ws) {
-    return mons[mi].floating[ws];
-}
-
 static void mon_setfocused(int mi, Node *n) {
     mons[mi].focused[curws] = n;
 }
@@ -376,16 +446,25 @@ static void mon_setfocused_at(int mi, int ws, Node *n) {
     mons[mi].focused[ws] = n;
 }
 
-static void mon_setfloating_at(int mi, int ws, Node *n) {
-    mons[mi].floating[ws] = n;
-}
-
 static Node *mkleaf(Window w) {
     Node *n = calloc(1, sizeof *n);
     n->leaf = 1;
     n->ratio = 0.5f;
     n->win = w;
     return n;
+}
+
+static int atom_in_window_property(Window win, Atom prop, Atom value) {
+    return window_has_atom(win, prop, value);
+}
+
+static int window_is_dialog_like(Window win) {
+    Window transient_for;
+    if (XGetTransientForHint(dpy, win, &transient_for)) return 1;
+    return atom_in_window_property(win, atom_net_wm_window_type, atom_net_wm_window_type_dialog) ||
+           atom_in_window_property(win, atom_net_wm_window_type, atom_net_wm_window_type_utility) ||
+           atom_in_window_property(win, atom_net_wm_window_type, atom_net_wm_window_type_toolbar) ||
+           atom_in_window_property(win, atom_net_wm_window_type, atom_net_wm_window_type_splash);
 }
 
 static Node *findleaf(Node *n, Window w) {
@@ -395,26 +474,10 @@ static Node *findleaf(Node *n, Window w) {
     return r ? r : findleaf(n->b, w);
 }
 
-static Node *findfloating(Node *n, Window w) {
-    for (; n; n = n->next) {
-        if (n->win == w) return n;
-    }
-    return NULL;
-}
-
-static Node *findnode_in_ws(int mi, int ws, Window w) {
-    Node *n = findleaf(mon_tree_at(mi, ws), w);
-    return n ? n : findfloating(mon_floating_at(mi, ws), w);
-}
-
-static Node *findnode(int mi, Window w) {
-    return findnode_in_ws(mi, curws, w);
-}
-
-static Node *findnode_any(Window w, int *out_mi, int *out_ws) {
+static Node *findleaf_any(Window w, int *out_mi, int *out_ws) {
     for (int mi = 0; mi < nmons; mi++) {
         for (int ws = 0; ws < MAXWS; ws++) {
-            Node *n = findnode_in_ws(mi, ws, w);
+            Node *n = findleaf(mon_tree_at(mi, ws), w);
             if (n) {
                 if (out_mi) *out_mi = mi;
                 if (out_ws) *out_ws = ws;
@@ -427,7 +490,7 @@ static Node *findnode_any(Window w, int *out_mi, int *out_ws) {
 
 static int monforwin(Window w) {
     for (int i = 0; i < nmons; i++) {
-        if (findnode(i, w)) return i;
+        if (findleaf(mon_tree(i), w)) return i;
     }
     return curmon;
 }
@@ -440,7 +503,7 @@ static Node *firstleaf(Node *n) {
 static Node *find_fullscreen_leaf(Node *n) {
     Node *r;
     if (!n) return NULL;
-    if (n->leaf) return (n->fullscreen || n->real_fullscreen) ? n : NULL;
+    if (n->leaf) return (n->real_fullscreen || n->fullscreen) ? n : NULL;
     r = find_fullscreen_leaf(n->a);
     return r ? r : find_fullscreen_leaf(n->b);
 }
@@ -453,6 +516,14 @@ static Node *find_real_fullscreen_leaf(Node *n) {
     return r ? r : find_real_fullscreen_leaf(n->b);
 }
 
+static int monitor_has_real_fullscreen(int mi) {
+    return find_real_fullscreen_leaf(mon_tree(mi)) != NULL;
+}
+
+static void raise_bar_if_needed(int mi) {
+    if (mons[mi].barwin && !monitor_has_real_fullscreen(mi)) XRaiseWindow(dpy, mons[mi].barwin);
+}
+
 static int workspace_has_windows(int ws) {
     for (int i = 0; i < nmons; i++) {
         if (mons[i].tree[ws]) return 1;
@@ -460,35 +531,43 @@ static int workspace_has_windows(int ws) {
     return 0;
 }
 
-static void collect_focusables(int mi, Node **list, int *count, int maxcount) {
-    collect_leaves(mon_tree(mi), list, count, maxcount);
-    for (Node *n = mon_floating_at(mi, curws); n && *count < maxcount; n = n->next) {
-        list[(*count)++] = n;
-    }
-}
-
 static Node *nextleaf(int mi, Node *cur) {
-    Node *nodes[256];
-    int count = 0;
-    collect_focusables(mi, nodes, &count, 256);
-    if (!count) return NULL;
-    if (!cur) return nodes[0];
-    for (int i = 0; i < count; i++) {
-        if (nodes[i] == cur) return nodes[(i + 1) % count];
+    Node *tree = mon_tree(mi);
+    if (!cur || !tree) return firstleaf(tree);
+    Node *n = cur;
+    while (n->par) {
+        if (n->par->a == n) {
+            Node *r = firstleaf(n->par->b);
+            if (r) return r;
+        }
+        n = n->par;
     }
-    return nodes[0];
+    return firstleaf(tree);
 }
 
 static Node *prevleaf(int mi, Node *cur) {
-    Node *nodes[256];
-    int count = 0;
-    collect_focusables(mi, nodes, &count, 256);
-    if (!count) return NULL;
-    if (!cur) return nodes[count - 1];
-    for (int i = 0; i < count; i++) {
-        if (nodes[i] == cur) return nodes[(i + count - 1) % count];
+    Node *tree = mon_tree(mi);
+    Node *prev = NULL;
+    Node *n;
+    if (!tree) return NULL;
+    if (!cur) {
+        n = firstleaf(tree);
+        if (!n) return NULL;
+        while ((n = nextleaf(mi, n)) && n != firstleaf(tree)) prev = n;
+        return prev ? prev : firstleaf(tree);
     }
-    return nodes[count - 1];
+    n = firstleaf(tree);
+    while (n) {
+        if (n == cur) break;
+        prev = n;
+        n = nextleaf(mi, n);
+        if (n == firstleaf(tree)) break;
+    }
+    if (prev) return prev;
+    n = firstleaf(tree);
+    prev = n;
+    while ((n = nextleaf(mi, prev)) && n != firstleaf(tree)) prev = n;
+    return prev;
 }
 
 static void swap_leaf_payload(Node *a, Node *b) {
@@ -516,28 +595,36 @@ static void drawborder(Node *n, int focused) {
 }
 
 static void raise_floating(Node *n) {
-    for (; n; n = n->next) {
-        XRaiseWindow(dpy, n->win);
+    if (!n) return;
+    if (n->leaf) {
+        if (n->floating) XRaiseWindow(dpy, n->win);
+        return;
     }
+    raise_floating(n->a);
+    raise_floating(n->b);
 }
 
-static int monitor_has_real_fullscreen(int mi) {
-    return find_real_fullscreen_leaf(mon_tree(mi)) != NULL;
-}
-
-static void raise_bar_if_needed(int mi) {
-    if (mons[mi].barwin && !monitor_has_real_fullscreen(mi)) XRaiseWindow(dpy, mons[mi].barwin);
+static void unmap_managed(Node *n) {
+    if (!n || !n->leaf) return;
+    n->ignore_unmap++;
+    XUnmapWindow(dpy, n->win);
 }
 
 static void show_only_leaf(Node *n, Node *target) {
     if (!n) return;
     if (n->leaf) {
         if (n == target) XMapRaised(dpy, n->win);
-        else XUnmapWindow(dpy, n->win);
+        else unmap_managed(n);
         return;
     }
     show_only_leaf(n->a, target);
     show_only_leaf(n->b, target);
+}
+
+static int has_tiled_leaf(Node *n) {
+    if (!n) return 0;
+    if (n->leaf) return !n->floating;
+    return has_tiled_leaf(n->a) || has_tiled_leaf(n->b);
 }
 
 static void tilenode(Node *n, int x, int y, int w, int h, Node *foc) {
@@ -550,7 +637,7 @@ static void tilenode(Node *n, int x, int y, int w, int h, Node *foc) {
         drawborder(n, n == foc);
         if (n->fullscreen || n->real_fullscreen) {
             XMoveResizeWindow(dpy, n->win, x, y, w - 2 * bw, h - 2 * bw);
-        } else {
+        } else if (!n->floating) {
             int tw = w - 2 * gap - 2 * bw;
             int th = h - 2 * gap - 2 * bw;
             if (tw < 1) tw = 1;
@@ -559,6 +646,15 @@ static void tilenode(Node *n, int x, int y, int w, int h, Node *foc) {
         }
         return;
     }
+    if (!has_tiled_leaf(n->a) && has_tiled_leaf(n->b)) {
+        tilenode(n->b, x, y, w, h, foc);
+        return;
+    }
+    if (!has_tiled_leaf(n->b) && has_tiled_leaf(n->a)) {
+        tilenode(n->a, x, y, w, h, foc);
+        return;
+    }
+    if (!has_tiled_leaf(n->a) && !has_tiled_leaf(n->b)) return;
     if (n->horiz) {
         int wa = (int)(w * n->ratio);
         tilenode(n->a, x, y, wa, h, foc);
@@ -573,7 +669,7 @@ static void tilenode(Node *n, int x, int y, int w, int h, Node *foc) {
 static int draw_tag_box(Window win, int x, int y, const char *text,
     unsigned long bg, unsigned long fg, int minw)
 {
-    int pad = 8;
+    int pad = bartextpad;
     int w = textw(text) + pad * 2;
     if (w < minw) w = minw;
     XSetForeground(dpy, bargc, bg);
@@ -583,26 +679,56 @@ static int draw_tag_box(Window win, int x, int y, const char *text,
     return w;
 }
 
-static int workspace_tag_width(int ws) {
-    char part[8];
-    snprintf(part, sizeof part, "%d", ws + 1);
-    return textw(part) + 16;
+typedef enum {
+    BAR_ITEM_NONE = 0,
+    BAR_ITEM_WORKSPACES,
+    BAR_ITEM_COMMAND,
+    BAR_ITEM_TITLE,
+    BAR_ITEM_CLOCK,
+    BAR_ITEM_BATTERY,
+    BAR_ITEM_MODE
+} BarItem;
+
+static BarItem parse_bar_item(const char *name) {
+    if (!strcasecmp(name, "workspaces")) return BAR_ITEM_WORKSPACES;
+    if (!strcasecmp(name, "command")) return BAR_ITEM_COMMAND;
+    if (!strcasecmp(name, "title")) return BAR_ITEM_TITLE;
+    if (!strcasecmp(name, "clock")) return BAR_ITEM_CLOCK;
+    if (!strcasecmp(name, "battery")) return BAR_ITEM_BATTERY;
+    if (!strcasecmp(name, "mode")) return BAR_ITEM_MODE;
+    return BAR_ITEM_NONE;
 }
 
-static int boxed_text_width(const char *text, int minw) {
-    int w;
-    if (!text || !text[0]) return 0;
-    w = textw(text) + 16;
-    return w < minw ? minw : w;
+static void build_bar_item_text(BarItem item, char *dst, size_t dstsz) {
+    dst[0] = 0;
+    switch (item) {
+    case BAR_ITEM_COMMAND:
+    case BAR_ITEM_MODE:
+        build_mode_text(dst, dstsz);
+        break;
+    case BAR_ITEM_TITLE:
+        build_title_text(dst, dstsz);
+        break;
+    case BAR_ITEM_CLOCK:
+        build_clock_text(dst, dstsz);
+        break;
+    case BAR_ITEM_BATTERY:
+        build_battery_text(dst, dstsz);
+        break;
+    default:
+        break;
+    }
 }
 
 static int workspace_section_width(void) {
     int width = 0;
     for (int i = 0; i < MAXWS; i++) {
+        char part[8];
         if (!workspace_has_windows(i) && i != curws) continue;
-        width += workspace_tag_width(i) + 6;
+        snprintf(part, sizeof part, "%d", i + 1);
+        width += textw(part) + bartextpad * 2 + baritemgap;
     }
-    return width > 0 ? width - 6 : 0;
+    return width;
 }
 
 static int draw_workspace_section(Window win, int x, int y) {
@@ -616,82 +742,62 @@ static int draw_workspace_section(Window win, int x, int y) {
             bg = cnorm;
             fg = barfg;
         } else if (workspace_has_windows(i)) {
-            bg = barbg;
             fg = barfg;
         }
-        curx += draw_tag_box(win, curx, y, part, bg, fg, 20);
-        curx += 6;
+        curx += draw_tag_box(win, curx, y, part, bg, fg, barwsminw);
+        curx += baritemgap;
     }
     return curx;
 }
 
-static int section_item_width(const char *item) {
+static int bar_item_width(BarItem item) {
     char tmp[256];
-    int width = 0;
 
-    tmp[0] = 0;
-    if (!strcasecmp(item, "workspaces")) return workspace_section_width();
-    if (!strcasecmp(item, "command")) {
-        build_mode_text(tmp, sizeof tmp);
-        width = boxed_text_width(tmp, 0);
-        if (mode == MODE_COMMAND && cmdline_len > 0) width += 6 + boxed_text_width(cmdline, 0);
-        return width;
+    if (item == BAR_ITEM_WORKSPACES) return workspace_section_width();
+    build_bar_item_text(item, tmp, sizeof tmp);
+    if (!tmp[0]) return 0;
+
+    switch (item) {
+    case BAR_ITEM_COMMAND:
+        return textw(tmp) + bartextpad * 2 +
+            ((mode == MODE_COMMAND && cmdline_len > 0) ? baritemgap + textw(cmdline) + bartextpad * 2 : 0);
+    case BAR_ITEM_TITLE:
+    case BAR_ITEM_CLOCK:
+    case BAR_ITEM_BATTERY:
+    case BAR_ITEM_MODE:
+        return textw(tmp) + bartextpad * 2;
+    default:
+        return 0;
     }
-    if (!strcasecmp(item, "title")) {
-        build_title_text(tmp, sizeof tmp);
-        return boxed_text_width(tmp, 0);
-    }
-    if (!strcasecmp(item, "clock")) {
-        build_clock_text(tmp, sizeof tmp);
-        return boxed_text_width(tmp, 0);
-    }
-    if (!strcasecmp(item, "battery")) {
-        build_battery_text(tmp, sizeof tmp);
-        return boxed_text_width(tmp, 0);
-    }
-    if (!strcasecmp(item, "mode")) {
-        build_mode_text(tmp, sizeof tmp);
-        return boxed_text_width(tmp, 0);
-    }
-    return 0;
 }
 
-static int draw_section_item(Window win, int x, int y, const char *item) {
+static int draw_bar_item(Window win, int x, int y, BarItem item) {
     char tmp[256];
     int curx = x;
 
-    tmp[0] = 0;
-    if (!strcasecmp(item, "workspaces")) return draw_workspace_section(win, x, y);
-    if (!strcasecmp(item, "command")) {
-        build_mode_text(tmp, sizeof tmp);
+    if (item == BAR_ITEM_WORKSPACES) return draw_workspace_section(win, x, y);
+
+    build_bar_item_text(item, tmp, sizeof tmp);
+    if (!tmp[0]) return curx;
+
+    switch (item) {
+    case BAR_ITEM_COMMAND:
         curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
         if (mode == MODE_COMMAND && cmdline_len > 0) {
-            curx += 6;
+            curx += baritemgap;
             curx += draw_tag_box(win, curx, y, cmdline, cnorm, barfg, 0);
         }
         return curx;
-    }
-    if (!strcasecmp(item, "title")) {
-        build_title_text(tmp, sizeof tmp);
-        if (tmp[0]) curx += draw_tag_box(win, curx, y, tmp, barbg, barfg, 0);
+    case BAR_ITEM_TITLE:
+        return curx + draw_tag_box(win, curx, y, tmp, barbg, barfg, 0);
+    case BAR_ITEM_CLOCK:
+    case BAR_ITEM_MODE:
+        return curx + draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
+    case BAR_ITEM_BATTERY:
+        return curx + draw_tag_box(win, curx, y, tmp, cnorm, barfg, 0);
+    default:
         return curx;
     }
-    if (!strcasecmp(item, "clock")) {
-        build_clock_text(tmp, sizeof tmp);
-        curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
-        return curx;
-    }
-    if (!strcasecmp(item, "battery")) {
-        build_battery_text(tmp, sizeof tmp);
-        if (tmp[0]) curx += draw_tag_box(win, curx, y, tmp, cnorm, barfg, 0);
-        return curx;
-    }
-    if (!strcasecmp(item, "mode")) {
-        build_mode_text(tmp, sizeof tmp);
-        curx += draw_tag_box(win, curx, y, tmp, baraccentbg, baraccentfg, 0);
-        return curx;
-    }
-    return curx;
 }
 
 static int section_width(const char *cfg) {
@@ -700,14 +806,13 @@ static int section_width(const char *cfg) {
     copystr(buf, sizeof buf, cfg);
     for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         char item[128];
+        BarItem kind;
         copystr(item, sizeof item, ltrim(tok));
         rtrim(item);
-        {
-            int itemw = section_item_width(item);
-            if (itemw > 0) width += itemw + 6;
-        }
+        kind = parse_bar_item(item);
+        if (kind != BAR_ITEM_NONE) width += bar_item_width(kind) + baritemgap;
     }
-    return width > 0 ? width - 6 : 0;
+    return width > 0 ? width - baritemgap : 0;
 }
 
 static int draw_section(Window win, int x, int y, const char *cfg) {
@@ -716,31 +821,29 @@ static int draw_section(Window win, int x, int y, const char *cfg) {
     copystr(buf, sizeof buf, cfg);
     for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         char item[128];
+        BarItem kind;
         copystr(item, sizeof item, ltrim(tok));
         rtrim(item);
-        {
-            int nextx = draw_section_item(win, curx, y, item);
-            if (nextx != curx) {
-                curx = nextx;
-                curx += 6;
-            }
-        }
+        kind = parse_bar_item(item);
+        if (kind == BAR_ITEM_NONE) continue;
+        curx = draw_bar_item(win, curx, y, kind);
+        curx += baritemgap;
     }
     return curx;
 }
 
 static void drawbar(int mi) {
     if (!mons[mi].barwin) return;
-    int leftx = 10, leftw, centx, rightx;
+    int leftx = barpadx, centx, rightx, leftw;
     int centerw = section_width(barcentercfg);
     int rightw = section_width(barrightcfg);
-    leftw = section_width(barleftcfg);
 
     XSetForeground(dpy, bargc, barbg);
     XFillRectangle(dpy, mons[mi].barwin, bargc, 0, 0, mons[mi].w, barh);
 
+    leftw = section_width(barleftcfg);
     draw_section(mons[mi].barwin, leftx, 0, barleftcfg);
-    rightx = mons[mi].w - rightw - 10;
+    rightx = mons[mi].w - rightw - barpadx;
     if (rightw > 0) draw_section(mons[mi].barwin, rightx, 0, barrightcfg);
     centx = (mons[mi].w - centerw) / 2;
     if (centerw > 0 && centx > leftx + leftw + 12 && centx + centerw < rightx - 12)
@@ -785,7 +888,7 @@ static void retile(void) {
             if (m->barwin) XMapRaised(dpy, m->barwin);
             showtree(mon_tree(i));
             tilenode(mon_tree(i), m->wx, m->wy, m->ww, m->wh, mon_focused(i));
-            raise_floating(mon_floating_at(i, curws));
+            raise_floating(mon_tree(i));
         }
         raise_bar_if_needed(i);
     }
@@ -806,9 +909,10 @@ static void setfocus(int mi, Node *n, int warp) {
     if (mode == MODE_INSERT) XSetInputFocus(dpy, n->win, RevertToPointerRoot, CurrentTime);
     XRaiseWindow(dpy, n->win);
     drawborder(n, 1);
-    raise_floating(mon_floating_at(mi, curws));
+    raise_floating(mon_tree(mi));
     raise_bar_if_needed(mi);
     if (warp) warpfocus(n);
+    update_active_window();
 }
 
 static void showtree(Node *n) {
@@ -821,44 +925,151 @@ static void showtree(Node *n) {
     showtree(n->b);
 }
 
+static void initatoms(void) {
+    atom_net_active_window = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
+    atom_net_client_list = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
+    atom_net_current_desktop = XInternAtom(dpy, "_NET_CURRENT_DESKTOP", False);
+    atom_net_number_of_desktops = XInternAtom(dpy, "_NET_NUMBER_OF_DESKTOPS", False);
+    atom_net_supported = XInternAtom(dpy, "_NET_SUPPORTED", False);
+    atom_net_supporting_wm_check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
+    atom_utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
+    atom_net_wm_window_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    atom_net_wm_window_type_dock = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DOCK", False);
+    atom_net_wm_window_type_dialog = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DIALOG", False);
+    atom_net_wm_window_type_utility = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+    atom_net_wm_window_type_toolbar = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLBAR", False);
+    atom_net_wm_window_type_splash = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_SPLASH", False);
+    atom_net_wm_desktop = XInternAtom(dpy, "_NET_WM_DESKTOP", False);
+    atom_net_wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
+    atom_net_wm_state_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+}
+
+static void setup_wm_check(void) {
+    static const char name[] = "nvwm";
+    wmcheckwin = XCreateSimpleWindow(dpy, root, -1, -1, 1, 1, 0, 0, 0);
+    XChangeProperty(dpy, wmcheckwin, atom_net_supporting_wm_check, XA_WINDOW, 32,
+        PropModeReplace, (unsigned char *)&wmcheckwin, 1);
+    XChangeProperty(dpy, root, atom_net_supporting_wm_check, XA_WINDOW, 32,
+        PropModeReplace, (unsigned char *)&wmcheckwin, 1);
+    XChangeProperty(dpy, wmcheckwin, XInternAtom(dpy, "_NET_WM_NAME", False),
+        atom_utf8_string, 8, PropModeReplace, (const unsigned char *)name, (int)strlen(name));
+}
+
+static void update_supported_atoms(void) {
+    Atom supported[] = {
+        atom_net_active_window,
+        atom_net_client_list,
+        atom_net_current_desktop,
+        atom_net_number_of_desktops,
+        atom_net_wm_window_type,
+        atom_net_wm_window_type_dock,
+        atom_net_wm_window_type_dialog,
+        atom_net_wm_window_type_utility,
+        atom_net_wm_window_type_toolbar,
+        atom_net_wm_window_type_splash,
+        atom_net_wm_desktop,
+        atom_net_wm_state,
+        atom_net_wm_state_fullscreen,
+    };
+    XChangeProperty(dpy, root, atom_net_supported, XA_ATOM, 32, PropModeReplace,
+        (unsigned char *)supported, (int)(sizeof supported / sizeof supported[0]));
+}
+
+static void collect_client_windows(Node *n, Window *list, int *count, int maxcount) {
+    if (!n || *count >= maxcount) return;
+    if (n->leaf) {
+        list[(*count)++] = n->win;
+        return;
+    }
+    collect_client_windows(n->a, list, count, maxcount);
+    collect_client_windows(n->b, list, count, maxcount);
+}
+
+static void update_client_list(void) {
+    Window list[1024];
+    int count = 0;
+    for (int mi = 0; mi < nmons; mi++) {
+        for (int ws = 0; ws < MAXWS; ws++) {
+            collect_client_windows(mon_tree_at(mi, ws), list, &count, 1024);
+        }
+    }
+    XChangeProperty(dpy, root, atom_net_client_list, XA_WINDOW, 32, PropModeReplace,
+        (unsigned char *)list, count);
+}
+
+static void update_current_desktop(void) {
+    unsigned long ws = (unsigned long)curws;
+    XChangeProperty(dpy, root, atom_net_current_desktop, XA_CARDINAL, 32, PropModeReplace,
+        (unsigned char *)&ws, 1);
+}
+
+static void update_number_of_desktops(void) {
+    unsigned long n = MAXWS;
+    XChangeProperty(dpy, root, atom_net_number_of_desktops, XA_CARDINAL, 32, PropModeReplace,
+        (unsigned char *)&n, 1);
+}
+
+static void update_active_window(void) {
+    Window win = None;
+    if (mon_focused(curmon)) win = mon_focused(curmon)->win;
+    XChangeProperty(dpy, root, atom_net_active_window, XA_WINDOW, 32, PropModeReplace,
+        (unsigned char *)&win, 1);
+}
+
+static void set_window_desktop(Window win, int ws) {
+    unsigned long val = (unsigned long)ws;
+    XChangeProperty(dpy, win, atom_net_wm_desktop, XA_CARDINAL, 32, PropModeReplace,
+        (unsigned char *)&val, 1);
+}
+
+static void apply_rules(Node *n, int *targetws) {
+    char class_name[64], instance_name[64], title[128];
+    if (!n || !n->leaf) return;
+    get_window_class(n->win, class_name, sizeof class_name, instance_name, sizeof instance_name);
+    get_window_title(n->win, title, sizeof title);
+
+    if (window_is_dialog_like(n->win)) n->floating = 1;
+
+    for (int i = 0; i < nrules; i++) {
+        Rule *r = &rules[i];
+        int match = 1;
+        if (r->class_name[0] && strcmp(r->class_name, class_name)) match = 0;
+        if (r->instance_name[0] && strcmp(r->instance_name, instance_name)) match = 0;
+        if (r->title[0] && strcmp(r->title, title)) match = 0;
+        if (!match) continue;
+        if (r->set_floating) n->floating = r->floating;
+        if (targetws && r->workspace >= 0) *targetws = r->workspace;
+    }
+}
+
 static void hidetree(Node *n) {
     if (!n) return;
     if (n->leaf) {
-        XUnmapWindow(dpy, n->win);
+        unmap_managed(n);
         return;
     }
     hidetree(n->a);
     hidetree(n->b);
 }
 
-static void showfloating(Node *n) {
-    for (; n; n = n->next) XMapRaised(dpy, n->win);
-}
-
-static void hidefloating(Node *n) {
-    for (; n; n = n->next) XUnmapWindow(dpy, n->win);
-}
-
 static void switch_workspace(int ws) {
     if (ws < 0 || ws >= MAXWS || ws == curws) return;
-    for (int i = 0; i < nmons; i++) {
-        hidetree(mons[i].tree[curws]);
-        hidefloating(mons[i].floating[curws]);
-    }
+    for (int i = 0; i < nmons; i++) hidetree(mons[i].tree[curws]);
     curws = ws;
-    for (int i = 0; i < nmons; i++) {
-        showtree(mons[i].tree[curws]);
-        showfloating(mons[i].floating[curws]);
-    }
+    for (int i = 0; i < nmons; i++) showtree(mons[i].tree[curws]);
     retile();
+    update_current_desktop();
     if (mon_focused(curmon)) setfocus(curmon, mon_focused(curmon), 1);
+    else update_active_window();
 }
 
 static void attach_to_ws(int mi, int ws, Node *leaf) {
     leaf->par = NULL;
+    set_window_desktop(leaf->win, ws);
     if (!mon_tree_at(mi, ws)) {
         mon_settree_at(mi, ws, leaf);
         mon_setfocused_at(mi, ws, leaf);
+        update_client_list();
         return;
     }
     Node *focused = mon_focused_at(mi, ws);
@@ -877,27 +1088,16 @@ static void attach_to_ws(int mi, int ws, Node *leaf) {
     t->par = sp;
     leaf->par = sp;
     mon_setfocused_at(mi, ws, leaf);
+    update_client_list();
 }
 
 static void attach(int mi, Node *leaf) { attach_to_ws(mi, curws, leaf); }
-
-static void attach_floating_to_ws(int mi, int ws, Node *leaf) {
-    leaf->floating = 1;
-    leaf->fullscreen = 0;
-    leaf->par = NULL;
-    leaf->next = mon_floating_at(mi, ws);
-    mon_setfloating_at(mi, ws, leaf);
-    mon_setfocused_at(mi, ws, leaf);
-}
-
-static void attach_floating(int mi, Node *leaf) { attach_floating_to_ws(mi, curws, leaf); }
-
-static void insert(int mi, Window w) { attach(mi, mkleaf(w)); }
 
 static void detach_from_ws(int mi, int ws, Node *n) {
     if (!n->par) {
         mon_settree_at(mi, ws, NULL);
         mon_setfocused_at(mi, ws, NULL);
+        update_client_list();
         return;
     }
     Node *p = n->par, *sib = p->a == n ? p->b : p->a;
@@ -908,37 +1108,22 @@ static void detach_from_ws(int mi, int ws, Node *n) {
     if (mon_focused_at(mi, ws) == n) mon_setfocused_at(mi, ws, firstleaf(sib));
     free(p);
     n->par = NULL;
+    update_client_list();
 }
 
 static void detach(int mi, Node *n) { detach_from_ws(mi, curws, n); }
 
-static void detach_floating_from_ws(int mi, int ws, Node *n) {
-    Node **pp = &mons[mi].floating[ws];
-    while (*pp && *pp != n) pp = &(*pp)->next;
-    if (!*pp) return;
-    *pp = n->next;
-    n->next = NULL;
-    n->floating = 0;
-    if (mon_focused_at(mi, ws) == n) {
-        Node *fallback = mon_floating_at(mi, ws);
-        if (!fallback) fallback = firstleaf(mon_tree_at(mi, ws));
-        mon_setfocused_at(mi, ws, fallback);
-    }
-}
-
-static void detach_floating(int mi, Node *n) { detach_floating_from_ws(mi, curws, n); }
-
 static void removewin(Window w) {
     int mi = monforwin(w);
-    Node *n = findnode(mi, w);
+    Node *n = findleaf(mon_tree(mi), w);
     if (!n) return;
     if (drag_node == n) {
         drag_node = NULL;
         drag_mode = 0;
     }
-    if (n->floating) detach_floating(mi, n);
-    else detach(mi, n);
+    detach(mi, n);
     free(n);
+    update_active_window();
 }
 
 static void collect_leaves(Node *n, Node **list, int *count, int maxcount) {
@@ -966,9 +1151,6 @@ static Node *find_directional_focus(int mi, Node *from, const char *dir) {
 
     if (!from) return NULL;
     collect_leaves(mon_tree(mi), nodes, &count, 256);
-    for (Node *f = mon_floating_at(mi, curws); f && count < 256; f = f->next) {
-        nodes[count++] = f;
-    }
     fx1 = from->x;
     fy1 = from->y;
     fx2 = from->x + from->w;
@@ -1014,7 +1196,25 @@ static Node *find_directional_focus(int mi, Node *from, const char *dir) {
             bestscore = score;
         }
     }
+    if (!best) {
+        if (!strcmp(dir, "left") || !strcmp(dir, "up")) return prevleaf(mi, from);
+        return nextleaf(mi, from);
+    }
     return best;
+}
+
+static int swap_in_direction(const char *dir) {
+    Node *cur = mon_focused(curmon);
+    Node *n;
+    Window focused_win;
+    if (!cur) return 1;
+    n = find_directional_focus(curmon, cur, dir);
+    if (!n || n == cur) return 1;
+    focused_win = cur->win;
+    swap_leaf_payload(cur, n);
+    retile();
+    setfocus(curmon, findleaf(mon_tree(curmon), focused_win), 1);
+    return 1;
 }
 
 static void move_focused_to_workspace(int targetws) {
@@ -1023,15 +1223,9 @@ static void move_focused_to_workspace(int targetws) {
     if (targetws < 0 || targetws >= MAXWS || targetws == curws) return;
     n = mon_focused(srcmon);
     if (!n) return;
-    if (n->floating) {
-        detach_floating_from_ws(srcmon, curws, n);
-        attach_floating_to_ws(srcmon, targetws, n);
-        XUnmapWindow(dpy, n->win);
-    } else {
-        detach_from_ws(srcmon, curws, n);
-        attach_to_ws(srcmon, targetws, n);
-        hidetree(n);
-    }
+    detach_from_ws(srcmon, curws, n);
+    attach_to_ws(srcmon, targetws, n);
+    hidetree(n);
     retile();
     if (mon_focused(curmon)) setfocus(curmon, mon_focused(curmon), 1);
 }
@@ -1114,6 +1308,10 @@ static void reset_config_defaults(void) {
     gap = 8;
     bw = 2;
     barh = 24;
+    barpadx = 10;
+    baritemgap = 6;
+    bartextpad = 8;
+    barwsminw = 20;
     cfocus = 0x5588ff;
     cnorm = 0x333333;
     barbg = 0x111111;
@@ -1123,13 +1321,14 @@ static void reset_config_defaults(void) {
     barmutedfg = 0xaaaaaa;
     copystr(term, sizeof term, "st");
     copystr(barfontname, sizeof barfontname, "9x15");
-    copystr(barleftcfg, sizeof barleftcfg, "workspaces");
+    copystr(barleftcfg, sizeof barleftcfg, "command,title,workspaces");
     copystr(barcentercfg, sizeof barcentercfg, "command");
     copystr(barrightcfg, sizeof barrightcfg, "clock");
     barpos = BAR_TOP;
     nmodbinds = 0;
     nnormalbinds = 0;
     ncmdbinds = 0;
+    nrules = 0;
     nautostart = 0;
     modbind_limit = MAXBINDS;
     normalbind_limit = MAXMODEBINDS;
@@ -1154,6 +1353,184 @@ static void updatenumlockmask(void) {
     XFreeModifiermap(modmap);
 }
 
+static void upsert_modbind(unsigned int mod, KeyCode code, const char *action) {
+    for (int i = 0; i < nmodbinds; i++) {
+        if (modbinds[i].mod == mod && modbinds[i].code == code) {
+            copystr(modbinds[i].action, sizeof modbinds[i].action, action);
+            return;
+        }
+    }
+    if (nmodbinds >= modbind_limit) return;
+    modbinds[nmodbinds].mod = mod;
+    modbinds[nmodbinds].code = code;
+    copystr(modbinds[nmodbinds].action, sizeof modbinds[nmodbinds].action, action);
+    nmodbinds++;
+}
+
+static void upsert_normalbind(KeySym sym, const char *action) {
+    for (int i = 0; i < nnormalbinds; i++) {
+        if (normalbinds[i].sym == sym) {
+            copystr(normalbinds[i].action, sizeof normalbinds[i].action, action);
+            return;
+        }
+    }
+    if (nnormalbinds >= normalbind_limit) return;
+    normalbinds[nnormalbinds].sym = sym;
+    copystr(normalbinds[nnormalbinds].action, sizeof normalbinds[nnormalbinds].action, action);
+    nnormalbinds++;
+}
+
+static void upsert_cmdbind(const char *name, const char *action) {
+    for (int i = 0; i < ncmdbinds; i++) {
+        if (!strcmp(cmdbinds[i].name, name)) {
+            copystr(cmdbinds[i].action, sizeof cmdbinds[i].action, action);
+            return;
+        }
+    }
+    if (ncmdbinds >= cmd_limit) return;
+    copystr(cmdbinds[ncmdbinds].name, sizeof cmdbinds[ncmdbinds].name, name);
+    copystr(cmdbinds[ncmdbinds].action, sizeof cmdbinds[ncmdbinds].action, action);
+    ncmdbinds++;
+}
+
+static void add_autostart_cmd(const char *cmd) {
+    if (!cmd || !*cmd || nautostart >= autostart_limit) return;
+    copystr(autostart_cmds[nautostart], sizeof autostart_cmds[nautostart], cmd);
+    nautostart++;
+}
+
+static int parse_bind_config(const char *line) {
+    char mode_name[64], keyexpr[128], action[256];
+
+    if (sscanf(line, "bind_%63[^ ] = %127[^=]= %255[^\n]", mode_name, keyexpr, action) != 3) return 0;
+    rtrim(mode_name);
+    rtrim(keyexpr);
+    rtrim(action);
+    if (!strcasecmp(mode_name, "insert")) {
+        char *kp = strrchr(keyexpr, '+');
+        KeySym sym;
+        KeyCode code;
+
+        kp = kp ? kp + 1 : keyexpr;
+        kp = ltrim(kp);
+        if (!*kp) return 1;
+        sym = parse_keysym_name(kp);
+        if (sym == NoSymbol) return 1;
+        code = XKeysymToKeycode(dpy, sym);
+        if (code) upsert_modbind(parse_mods(keyexpr), code, action);
+        return 1;
+    }
+    if (!strcasecmp(mode_name, "normal")) {
+        KeySym sym = parse_keysym_name(keyexpr);
+        if (sym != NoSymbol) upsert_normalbind(sym, action);
+        return 1;
+    }
+    return 1;
+}
+
+static int parse_command_config(const char *line) {
+    char cmd_name[64], cmd_action[256];
+
+    if (sscanf(line, "command = %63[^=]= %255[^\n]", cmd_name, cmd_action) != 2) return 0;
+    rtrim(cmd_name);
+    rtrim(cmd_action);
+    upsert_cmdbind(skip_command_prefix(cmd_name), cmd_action);
+    return 1;
+}
+
+static int parse_rule_config(const char *line) {
+    char rule_match[128], rule_action[128];
+    Rule *r;
+    char *kind, *value;
+    char *act;
+
+    if (sscanf(line, "rule = %127[^=]= %127[^\n]", rule_match, rule_action) != 2) return 0;
+    rtrim(rule_match);
+    rtrim(rule_action);
+    if (nrules >= MAXRULES) return 1;
+
+    r = &rules[nrules];
+    memset(r, 0, sizeof *r);
+    r->workspace = -1;
+    kind = ltrim(rule_match);
+    value = strchr(kind, ':');
+    if (!value) return 1;
+    *value++ = 0;
+    kind = ltrim(kind);
+    value = ltrim(value);
+    if (!strcasecmp(kind, "class")) copystr(r->class_name, sizeof r->class_name, value);
+    else if (!strcasecmp(kind, "instance")) copystr(r->instance_name, sizeof r->instance_name, value);
+    else if (!strcasecmp(kind, "title")) copystr(r->title, sizeof r->title, value);
+    else return 1;
+
+    for (act = strtok(rule_action, ","); act; act = strtok(NULL, ",")) {
+        act = ltrim(act);
+        rtrim(act);
+        if (!strcasecmp(act, "float")) {
+            r->set_floating = 1;
+            r->floating = 1;
+        } else if (!strcasecmp(act, "tile")) {
+            r->set_floating = 1;
+            r->floating = 0;
+        } else if (!strncasecmp(act, "workspace:", 10)) {
+            int ws = atoi(act + 10);
+            if (ws >= 1 && ws <= MAXWS) r->workspace = ws - 1;
+        }
+    }
+    nrules++;
+    return 1;
+}
+
+static int parse_key_value(char *line, char *k, size_t ksz, char *v, size_t vsz) {
+    char *eq = strchr(line, '=');
+    if (!eq) return 0;
+    *eq = 0;
+    copystr(k, ksz, ltrim(line));
+    rtrim(k);
+    copystr(v, vsz, ltrim(eq + 1));
+    rtrim(v);
+    return 1;
+}
+
+static int apply_limit_config(const char *k, const char *v) {
+    if (!strcmp(k, "insert_bind_limit")) modbind_limit = clampi(atoi(v), 1, MAXBINDS);
+    else if (!strcmp(k, "normal_bind_limit")) normalbind_limit = clampi(atoi(v), 1, MAXMODEBINDS);
+    else if (!strcmp(k, "command_limit")) cmd_limit = clampi(atoi(v), 1, MAXCMDS);
+    else if (!strcmp(k, "autostart_limit")) autostart_limit = clampi(atoi(v), 1, MAXAUTOSTART);
+    else return 0;
+    return 1;
+}
+
+static int apply_scalar_config(const char *k, const char *v) {
+    if (!strcmp(k, "gap")) gap = atoi(v);
+    else if (!strcmp(k, "border")) bw = atoi(v);
+    else if (!strcmp(k, "bar_height")) barh = atoi(v);
+    else if (!strcmp(k, "bar_padding_x")) barpadx = atoi(v);
+    else if (!strcmp(k, "bar_item_gap")) baritemgap = atoi(v);
+    else if (!strcmp(k, "bar_text_padding")) bartextpad = atoi(v);
+    else if (!strcmp(k, "bar_workspace_min_width")) barwsminw = atoi(v);
+    else if (!strcmp(k, "border_focus")) cfocus = hcol(v);
+    else if (!strcmp(k, "border_normal")) cnorm = hcol(v);
+    else if (!strcmp(k, "bar_bg")) barbg = hcol(v);
+    else if (!strcmp(k, "bar_fg")) barfg = hcol(v);
+    else if (!strcmp(k, "bar_accent_bg")) baraccentbg = hcol(v);
+    else if (!strcmp(k, "bar_accent_fg")) baraccentfg = hcol(v);
+    else if (!strcmp(k, "bar_muted_fg")) barmutedfg = hcol(v);
+    else if (!strcmp(k, "bar_font")) copystr(barfontname, sizeof barfontname, v);
+    else if (!strcmp(k, "bar_left")) copystr(barleftcfg, sizeof barleftcfg, v);
+    else if (!strcmp(k, "bar_center")) copystr(barcentercfg, sizeof barcentercfg, v);
+    else if (!strcmp(k, "bar_right")) copystr(barrightcfg, sizeof barrightcfg, v);
+    else if (!strcmp(k, "bar_position")) {
+        if (!strcasecmp(v, "bottom")) barpos = BAR_BOTTOM;
+        else barpos = BAR_TOP;
+    } else if (!strcmp(k, "terminal")) {
+        copystr(term, sizeof term, v);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 static void grab_mod_binds(void) {
     for (int i = 0; i < nmodbinds; i++) {
         XGrabKey(dpy, modbinds[i].code, modbinds[i].mod, root, True, GrabModeAsync, GrabModeAsync);
@@ -1166,143 +1543,59 @@ static void grab_mod_binds(void) {
     }
 }
 
-static void add_insert_bind(const char *keyexpr, const char *action) {
-    char *kp;
-    KeySym sym;
-    KeyCode code;
-
-    if (nmodbinds >= modbind_limit) return;
-    kp = strrchr(keyexpr, '+');
-    kp = kp ? kp + 1 : (char *)keyexpr;
-    kp = ltrim(kp);
-    if (!*kp) return;
-
-    sym = parse_keysym_name(kp);
-    if (sym == NoSymbol) return;
-    code = XKeysymToKeycode(dpy, sym);
-    if (!code) return;
-
-    modbinds[nmodbinds].mod = parse_mods(keyexpr);
-    modbinds[nmodbinds].code = code;
-    copystr(modbinds[nmodbinds].action, sizeof modbinds[nmodbinds].action, action);
-    nmodbinds++;
-}
-
-static void add_normal_bind(const char *keyexpr, const char *action) {
-    KeySym sym;
-    if (nnormalbinds >= normalbind_limit) return;
-    sym = parse_keysym_name(keyexpr);
-    if (sym == NoSymbol) return;
-    normalbinds[nnormalbinds].sym = sym;
-    copystr(normalbinds[nnormalbinds].action, sizeof normalbinds[nnormalbinds].action, action);
-    nnormalbinds++;
-}
-
-static void add_command_bind(const char *name, const char *action) {
-    if (ncmdbinds >= cmd_limit) return;
-    copystr(cmdbinds[ncmdbinds].name, sizeof cmdbinds[ncmdbinds].name,
-        skip_command_prefix(name));
-    copystr(cmdbinds[ncmdbinds].action, sizeof cmdbinds[ncmdbinds].action, action);
-    ncmdbinds++;
+static void loadcfg_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[512], k[64], v[448];
+    while (fgets(line, sizeof line, f)) {
+        char *p = ltrim(line);
+        if (!*p || *p == '#') continue;
+        if (parse_bind_config(p) || parse_command_config(p) || parse_rule_config(p)) continue;
+        if (!parse_key_value(p, k, sizeof k, v, sizeof v)) continue;
+        if (!strcmp(k, "autostart")) {
+            add_autostart_cmd(v);
+            continue;
+        }
+        if (apply_limit_config(k, v)) continue;
+        apply_scalar_config(k, v);
+    }
+    fclose(f);
 }
 
 static void loadcfg(void) {
-    const char *cfgpaths[] = {
-        "/etc/viwm/config.conf",
-        "./config.conf",
-        NULL
-    };
+    char homecfg[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        snprintf(homecfg, sizeof homecfg, "%s/.config/nvwm/config.conf", home);
+    } else {
+        homecfg[0] = 0;
+    }
 
     reset_config_defaults();
-    for (int i = 0; cfgpaths[i]; i++) {
-        FILE *f = fopen(cfgpaths[i], "r");
-        if (!f) continue;
-        char line[512], k[64], v[448];
-        while (fgets(line, sizeof line, f)) {
-            char *p = ltrim(line);
-            char mode_name[64], keyexpr[128], action[256];
-            char cmd_name[64], cmd_action[256];
-            if (!*p || *p == '#') continue;
-            if (sscanf(p, "bind_%63[^ ] = %127[^=]= %255[^\n]", mode_name, keyexpr, action) == 3) {
-                rtrim(mode_name);
-                rtrim(keyexpr);
-                rtrim(action);
-                if (!strcasecmp(mode_name, "insert")) add_insert_bind(keyexpr, action);
-                else if (!strcasecmp(mode_name, "normal")) add_normal_bind(keyexpr, action);
-                continue;
-            }
-            if (sscanf(p, "command = %63[^=]= %255[^\n]", cmd_name, cmd_action) == 2) {
-                rtrim(cmd_name);
-                rtrim(cmd_action);
-                add_command_bind(cmd_name, cmd_action);
-                continue;
-            }
-            {
-                char *eq = strchr(p, '=');
-                if (!eq) continue;
-                *eq = 0;
-                copystr(k, sizeof k, ltrim(p));
-                rtrim(k);
-                copystr(v, sizeof v, ltrim(eq + 1));
-                rtrim(v);
-            }
-            if (!strcmp(k, "autostart")) {
-                if (nautostart < autostart_limit && v[0]) {
-                    copystr(autostart_cmds[nautostart], sizeof autostart_cmds[nautostart], v);
-                    nautostart++;
-                }
-                continue;
-            }
-            if (!strcmp(k, "insert_bind_limit")) {
-                modbind_limit = clampi(atoi(v), 1, MAXBINDS);
-                continue;
-            }
-            if (!strcmp(k, "normal_bind_limit")) {
-                normalbind_limit = clampi(atoi(v), 1, MAXMODEBINDS);
-                continue;
-            }
-            if (!strcmp(k, "command_limit")) {
-                cmd_limit = clampi(atoi(v), 1, MAXCMDS);
-                continue;
-            }
-            if (!strcmp(k, "autostart_limit")) {
-                autostart_limit = clampi(atoi(v), 1, MAXAUTOSTART);
-                continue;
-            }
-            if (!strcmp(k, "gap")) gap = atoi(v);
-            else if (!strcmp(k, "border")) bw = atoi(v);
-            else if (!strcmp(k, "bar_height")) barh = atoi(v);
-            else if (!strcmp(k, "border_focus")) cfocus = hcol(v);
-            else if (!strcmp(k, "border_normal")) cnorm = hcol(v);
-            else if (!strcmp(k, "bar_bg")) barbg = hcol(v);
-            else if (!strcmp(k, "bar_fg")) barfg = hcol(v);
-            else if (!strcmp(k, "bar_accent_bg")) baraccentbg = hcol(v);
-            else if (!strcmp(k, "bar_accent_fg")) baraccentfg = hcol(v);
-            else if (!strcmp(k, "bar_muted_fg")) barmutedfg = hcol(v);
-            else if (!strcmp(k, "bar_font")) copystr(barfontname, sizeof barfontname, v);
-            else if (!strcmp(k, "bar_left")) copystr(barleftcfg, sizeof barleftcfg, v);
-            else if (!strcmp(k, "bar_center")) copystr(barcentercfg, sizeof barcentercfg, v);
-            else if (!strcmp(k, "bar_right")) copystr(barrightcfg, sizeof barrightcfg, v);
-            else if (!strcmp(k, "bar_position")) {
-                if (!strcasecmp(v, "bottom")) barpos = BAR_BOTTOM;
-                else barpos = BAR_TOP;
-            }
-            else if (!strcmp(k, "terminal")) copystr(term, sizeof term, v);
-        }
-        fclose(f);
-        break;
-    }
+    if (homecfg[0]) loadcfg_file(homecfg);
+    else loadcfg_file("/etc/nvwm/config.conf");
 }
 
 static void run_autostart(void) {
     for (int i = 0; i < nautostart; i++) spawn(autostart_cmds[i]);
 }
 
+static void reloadwm(void) {
+    XUngrabKey(dpy, AnyKey, AnyModifier, root);
+    loadcfg();
+    updatenumlockmask();
+    grab_mod_binds();
+    setupbars();
+    retile();
+    if (mon_focused(curmon)) setfocus(curmon, mon_focused(curmon), 0);
+    else update_active_window();
+    drawbars();
+}
+
 static void set_net_wm_state(Window win, int fullscreen) {
     if (fullscreen) {
         Atom atoms[1] = { atom_net_wm_state_fullscreen };
-        XChangeProperty(dpy, win, atom_net_wm_state, XA_ATOM, 32, PropModeReplace,
-            (unsigned char *)atoms, 1);
+        XChangeProperty(dpy, win, atom_net_wm_state, XA_ATOM, 32, PropModeReplace, (unsigned char *)atoms, 1);
     } else {
         XDeleteProperty(dpy, win, atom_net_wm_state);
     }
@@ -1329,25 +1622,14 @@ static int window_wants_fullscreen(Window win) {
     return wants;
 }
 
-static void ensure_tiled_for_workspace(int mi, int ws, Node *n) {
-    if (!n || !n->floating) return;
-    detach_floating_from_ws(mi, ws, n);
-    {
-        int oldws = curws;
-        curws = ws;
-        attach_to_ws(mi, ws, n);
-        curws = oldws;
-    }
-}
-
 static void apply_real_fullscreen(Node *n, Window win, int mi, int ws, int want, int focus_if_visible) {
     if (!n) return;
-    if (want) {
-        ensure_tiled_for_workspace(mi, ws, n);
-    }
     if (n->real_fullscreen == want) return;
     n->real_fullscreen = want;
-    if (want) n->fullscreen = 0;
+    if (want) {
+        n->fullscreen = 0;
+        n->floating = 0;
+    }
     set_net_wm_state(win, want);
     retile();
     if (ws == curws) {
@@ -1357,58 +1639,25 @@ static void apply_real_fullscreen(Node *n, Window win, int mi, int ws, int want,
     }
 }
 
-static void sync_window_fullscreen(Window win) {
-    int mi = 0, ws = 0;
-    Node *n = findnode_any(win, &mi, &ws);
-    if (!n) return;
-    apply_real_fullscreen(n, n->win, mi, ws, window_wants_fullscreen(win), 0);
-}
-
-static void handle_client_fullscreen(Window win, long action, Atom first, Atom second) {
-    int requested = 0;
+static void handle_client_fullscreen(Window win, long action, Atom a1, Atom a2) {
     int mi = 0, ws = 0;
     Node *n;
-
-    if (first != atom_net_wm_state_fullscreen && second != atom_net_wm_state_fullscreen) return;
-    n = findnode_any(win, &mi, &ws);
+    int wants = 0;
+    if (a1 != atom_net_wm_state_fullscreen && a2 != atom_net_wm_state_fullscreen) return;
+    n = findleaf_any(win, &mi, &ws);
     if (!n) return;
-
-    if (action == 0) requested = 0;
-    else if (action == 1) requested = 1;
-    else if (action == 2) requested = !n->real_fullscreen;
+    if (action == 1) wants = 1;
+    else if (action == 0) wants = 0;
+    else if (action == 2) wants = !n->real_fullscreen;
     else return;
-    apply_real_fullscreen(n, win, mi, ws, requested, 1);
+    apply_real_fullscreen(n, win, mi, ws, wants, 1);
 }
 
-static void initatoms(void) {
-    atom_net_supported = XInternAtom(dpy, "_NET_SUPPORTED", False);
-    atom_net_supporting_wm_check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
-    atom_utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
-    atom_net_wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
-    atom_net_wm_state_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
-}
-
-static void setup_wm_check(void) {
-    static const char name[] = "viwm";
-    Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
-    wmcheckwin = XCreateSimpleWindow(dpy, root, -1, -1, 1, 1, 0, 0, 0);
-    XChangeProperty(dpy, wmcheckwin, atom_net_supporting_wm_check, XA_WINDOW, 32,
-        PropModeReplace, (unsigned char *)&wmcheckwin, 1);
-    XChangeProperty(dpy, root, atom_net_supporting_wm_check, XA_WINDOW, 32,
-        PropModeReplace, (unsigned char *)&wmcheckwin, 1);
-    XChangeProperty(dpy, wmcheckwin, net_wm_name, atom_utf8_string, 8,
-        PropModeReplace, (const unsigned char *)name, (int)strlen(name));
-}
-
-static void update_supported_atoms(void) {
-    Atom supported[] = {
-        atom_net_supported,
-        atom_net_supporting_wm_check,
-        atom_net_wm_state,
-        atom_net_wm_state_fullscreen,
-    };
-    XChangeProperty(dpy, root, atom_net_supported, XA_ATOM, 32, PropModeReplace,
-        (unsigned char *)supported, (int)(sizeof supported / sizeof supported[0]));
+static void sync_window_fullscreen(Window win) {
+    int mi = 0, ws = 0;
+    Node *n = findleaf_any(win, &mi, &ws);
+    if (!n) return;
+    apply_real_fullscreen(n, n->win, mi, ws, window_wants_fullscreen(win), 0);
 }
 
 static void enter_mode(InputMode newmode) {
@@ -1464,6 +1713,10 @@ static int apply_wm_action(const char *action) {
         if (mon_focused(curmon)) XKillClient(dpy, mon_focused(curmon)->win);
         return 1;
     }
+    if (!strcmp(action, "wm:reload")) {
+        reloadwm();
+        return 1;
+    }
     if (!strcmp(action, "wm:focus_next")) {
         Node *n = nextleaf(curmon, mon_focused(curmon));
         if (n && n != mon_focused(curmon)) setfocus(curmon, n, 1);
@@ -1496,6 +1749,10 @@ static int apply_wm_action(const char *action) {
         }
         return 1;
     }
+    if (!strcmp(action, "wm:swap_left")) return swap_in_direction("left");
+    if (!strcmp(action, "wm:swap_right")) return swap_in_direction("right");
+    if (!strcmp(action, "wm:swap_up")) return swap_in_direction("up");
+    if (!strcmp(action, "wm:swap_down")) return swap_in_direction("down");
     if (!strcmp(action, "wm:focus_left")) {
         Node *n = find_directional_focus(curmon, mon_focused(curmon), "left");
         if (n) setfocus(curmon, n, 1);
@@ -1542,35 +1799,25 @@ static int apply_wm_action(const char *action) {
     }
     if (!strcmp(action, "wm:toggle_float")) {
         if (!mon_focused(curmon)) return 1;
+        mon_focused(curmon)->floating ^= 1;
         if (mon_focused(curmon)->floating) {
-            Node *n = mon_focused(curmon);
-            detach_floating(curmon, n);
-            attach(curmon, n);
-            setfocus(curmon, n, 0);
-        } else {
-            Node *n = mon_focused(curmon);
             int fw = m->ww / 2;
             int fh = m->wh / 2;
             int fx = m->wx + (m->ww - fw) / 2;
             int fy = m->wy + (m->wh - fh) / 2;
-            detach(curmon, n);
-            attach_floating(curmon, n);
-            XMoveResizeWindow(dpy, n->win, fx, fy, fw - 2 * bw, fh - 2 * bw);
-            XRaiseWindow(dpy, n->win);
+            XMoveResizeWindow(dpy, mon_focused(curmon)->win, fx, fy, fw - 2 * bw, fh - 2 * bw);
+            XRaiseWindow(dpy, mon_focused(curmon)->win);
         }
         retile();
         return 1;
     }
     if (!strcmp(action, "wm:toggle_fullscreen")) {
         if (!mon_focused(curmon)) return 1;
-        if (mon_focused(curmon)->floating) {
-            Node *n = mon_focused(curmon);
-            detach_floating(curmon, n);
-            attach(curmon, n);
-            setfocus(curmon, n, 0);
-        }
         mon_focused(curmon)->fullscreen ^= 1;
-        if (mon_focused(curmon)->fullscreen) mon_focused(curmon)->real_fullscreen = 0;
+        if (mon_focused(curmon)->fullscreen) {
+            mon_focused(curmon)->floating = 0;
+            mon_focused(curmon)->real_fullscreen = 0;
+        }
         retile();
         XRaiseWindow(dpy, mon_focused(curmon)->win);
         return 1;
@@ -1632,6 +1879,16 @@ static int run_command_line(void) {
                 return keep;
             }
         }
+        if (!strcmp(name, "w!")) {
+            int keep = apply_wm_action("wm:reload");
+            if (mode == MODE_COMMAND) enter_mode(MODE_NORMAL);
+            return keep;
+        }
+        if (!strcmp(name, "q!")) {
+            int keep = apply_wm_action("wm:quit");
+            if (mode == MODE_COMMAND) enter_mode(MODE_NORMAL);
+            return keep;
+        }
     }
     enter_mode(MODE_NORMAL);
     return 0;
@@ -1680,8 +1937,10 @@ static int handle_normal_key(XKeyEvent *kev, KeySym sym) {
         enter_mode(MODE_INSERT);
         return 1;
     }
-    if (sym == XK_Left) return apply_wm_action("wm:focus_prev");
-    if (sym == XK_Right) return apply_wm_action("wm:focus_next");
+    if (sym == XK_Left || sym == XK_KP_Left) return apply_wm_action("wm:focus_prev");
+    if (sym == XK_Right || sym == XK_KP_Right) return apply_wm_action("wm:focus_next");
+    if (sym == XK_Up || sym == XK_KP_Up) return apply_wm_action("wm:focus_up");
+    if (sym == XK_Down || sym == XK_KP_Down) return apply_wm_action("wm:focus_down");
     for (int i = 0; i < nnormalbinds; i++) {
         if (normalbinds[i].sym == sym) {
             return apply_wm_action(normalbinds[i].action);
@@ -1692,6 +1951,13 @@ static int handle_normal_key(XKeyEvent *kev, KeySym sym) {
 
 static void setupbars(void) {
     XGCValues gcv;
+    XClassHint hint;
+    Atom dock_type[1] = { atom_net_wm_window_type_dock };
+    if (bargc) XFreeGC(dpy, bargc);
+    if (barfont) {
+        XFreeFont(dpy, barfont);
+        barfont = NULL;
+    }
     barfont = XLoadQueryFont(dpy, barfontname);
     if (!barfont) barfont = XLoadQueryFont(dpy, "9x15");
     if (!barfont) barfont = XLoadQueryFont(dpy, "fixed");
@@ -1706,11 +1972,21 @@ static void setupbars(void) {
         if (m->wh < 1) m->wh = 1;
         if (barpos == BAR_TOP) {
             m->wy = m->y + barh;
-            m->barwin = XCreateSimpleWindow(dpy, root, m->x, m->y, m->w, barh, 0, barbg, barbg);
+            if (!m->barwin) m->barwin = XCreateSimpleWindow(dpy, root, m->x, m->y, m->w, barh, 0, barbg, barbg);
+            XMoveResizeWindow(dpy, m->barwin, m->x, m->y, m->w, barh);
         } else {
             m->wy = m->y;
-            m->barwin = XCreateSimpleWindow(dpy, root, m->x, m->y + m->h - barh, m->w, barh, 0, barbg, barbg);
+            if (!m->barwin) m->barwin = XCreateSimpleWindow(dpy, root, m->x, m->y + m->h - barh, m->w, barh, 0, barbg, barbg);
+            XMoveResizeWindow(dpy, m->barwin, m->x, m->y + m->h - barh, m->w, barh);
         }
+        XSetWindowBackground(dpy, m->barwin, barbg);
+        XClearWindow(dpy, m->barwin);
+        XChangeProperty(dpy, m->barwin, atom_net_wm_window_type, XA_ATOM, 32,
+            PropModeReplace, (unsigned char *)dock_type, 1);
+        XStoreName(dpy, m->barwin, "nvwm-bar");
+        hint.res_name = "nvwm-bar";
+        hint.res_class = "NVWMBar";
+        XSetClassHint(dpy, m->barwin, &hint);
         XDefineCursor(dpy, m->barwin, normalcursor);
         XSelectInput(dpy, m->barwin, ExposureMask);
         XMapRaised(dpy, m->barwin);
@@ -1729,10 +2005,15 @@ int main(void) {
     sw = DisplayWidth(dpy, scr);
     sh = DisplayHeight(dpy, scr);
     normalcursor = XCreateFontCursor(dpy, XC_left_ptr);
+    movecursor = XCreateFontCursor(dpy, XC_fleur);
+    resizecursor = XCreateFontCursor(dpy, XC_bottom_right_corner);
     XDefineCursor(dpy, root, normalcursor);
     initatoms();
     setup_wm_check();
     update_supported_atoms();
+    update_number_of_desktops();
+    update_current_desktop();
+    update_active_window();
 
     int xiev, xierr;
     if (XineramaQueryExtension(dpy, &xiev, &xierr) && XineramaIsActive(dpy)) {
@@ -1764,10 +2045,10 @@ int main(void) {
 
     XGrabButton(dpy, Button1, MOD, root, False,
         ButtonPressMask | ButtonReleaseMask,
-        GrabModeSync, GrabModeAsync, None, None);
+        GrabModeAsync, GrabModeAsync, None, None);
     XGrabButton(dpy, Button3, MOD, root, False,
         ButtonPressMask | ButtonReleaseMask,
-        GrabModeSync, GrabModeAsync, None, None);
+        GrabModeAsync, GrabModeAsync, None, None);
 
     while (running) {
         while (XPending(dpy)) {
@@ -1790,25 +2071,20 @@ int main(void) {
                 Window dw;
                 int rx, ry, wx, wy;
                 unsigned msk;
+                Node *n;
+                int targetws = curws;
                 XQueryPointer(dpy, root, &dw, &dw, &rx, &ry, &wx, &wy, &msk);
                 int mi = monforpt(rx, ry);
-                insert(mi, ev.xmaprequest.window);
-                sync_window_fullscreen(ev.xmaprequest.window);
+                n = mkleaf(ev.xmaprequest.window);
+                apply_rules(n, &targetws);
+                if (window_has_atom(ev.xmaprequest.window, atom_net_wm_state,
+                        atom_net_wm_state_fullscreen)) {
+                    n->real_fullscreen = 1;
+                }
+                attach_to_ws(mi, targetws, n);
+                if (targetws != curws) unmap_managed(n);
                 retile();
-                setfocus(mi, mon_focused(mi), 1);
-            }
-            break;
-
-        case PropertyNotify:
-            if (ev.xproperty.atom == atom_net_wm_state) {
-                sync_window_fullscreen(ev.xproperty.window);
-            }
-            break;
-
-        case ClientMessage:
-            if (ev.xclient.message_type == atom_net_wm_state) {
-                handle_client_fullscreen(ev.xclient.window, ev.xclient.data.l[0],
-                    (Atom)ev.xclient.data.l[1], (Atom)ev.xclient.data.l[2]);
+                if (targetws == curws) setfocus(mi, n, 1);
             }
             break;
 
@@ -1819,10 +2095,46 @@ int main(void) {
             break;
 
         case UnmapNotify:
-            if (ev.xunmap.send_event) {
-                removewin(ev.xunmap.window);
-                retile();
-                if (mon_focused(curmon)) setfocus(curmon, mon_focused(curmon), 0);
+            {
+                int mi = 0, ws = 0;
+                Node *n = findleaf_any(ev.xunmap.window, &mi, &ws);
+                if (n) {
+                    if (n->ignore_unmap > 0) {
+                        n->ignore_unmap--;
+                    } else {
+                        removewin(ev.xunmap.window);
+                        retile();
+                        if (mon_focused(curmon)) setfocus(curmon, mon_focused(curmon), 0);
+                    }
+                } else if (ev.xunmap.send_event) {
+                    removewin(ev.xunmap.window);
+                    retile();
+                    if (mon_focused(curmon)) setfocus(curmon, mon_focused(curmon), 0);
+                }
+            }
+            break;
+
+        case PropertyNotify:
+            if (ev.xproperty.atom == atom_net_wm_state) {
+                sync_window_fullscreen(ev.xproperty.window);
+            }
+            break;
+
+        case ClientMessage:
+            if (ev.xclient.message_type == atom_net_current_desktop) {
+                switch_workspace((int)ev.xclient.data.l[0]);
+                break;
+            }
+            if (ev.xclient.message_type == atom_net_active_window) {
+                int mi = monforwin(ev.xclient.window);
+                Node *n = findleaf(mon_tree(mi), ev.xclient.window);
+                if (n) setfocus(mi, n, 0);
+                break;
+            }
+            if (ev.xclient.message_type == atom_net_wm_state) {
+                handle_client_fullscreen(ev.xclient.window, ev.xclient.data.l[0],
+                    (Atom)ev.xclient.data.l[1], (Atom)ev.xclient.data.l[2]);
+                break;
             }
             break;
 
@@ -1845,54 +2157,56 @@ int main(void) {
             if (mode != MODE_INSERT) break;
             if (ev.xcrossing.mode == NotifyNormal) {
                 int mi = monforwin(ev.xcrossing.window);
-                Node *n = findnode(mi, ev.xcrossing.window);
+                Node *n = findleaf(mon_tree(mi), ev.xcrossing.window);
                 if (n && n != mon_focused(mi)) setfocus(mi, n, 0);
             }
             break;
 
         case ButtonPress: {
             Window clicked = ev.xbutton.subwindow ? ev.xbutton.subwindow : ev.xbutton.window;
-            if (clicked == root) {
-                XAllowEvents(dpy, ReplayPointer, ev.xbutton.time);
-                break;
-            }
+            if (clicked == root) break;
 
             int mi = monforpt(ev.xbutton.x_root, ev.xbutton.y_root);
             Node *n = NULL;
             for (int i = 0; i < nmons && !n; i++) {
-                if ((n = findnode(i, clicked))) mi = i;
+                if ((n = findleaf(mon_tree(i), clicked))) mi = i;
+            }
+            if (!n || (ev.xbutton.button != Button1 && ev.xbutton.button != Button3)) break;
+
+            if (!n->real_fullscreen && !n->floating) {
+                int fx = n->x + gap;
+                int fy = n->y + gap;
+                int fw = n->w - 2 * gap;
+                int fh = n->h - 2 * gap;
+                if (fw < 50) fw = 50;
+                if (fh < 50) fh = 50;
+                n->floating = 1;
+                XMoveResizeWindow(dpy, n->win, fx, fy, fw - 2 * bw, fh - 2 * bw);
+                retile();
             }
 
-            if (n && n->floating) {
-                XAllowEvents(dpy, AsyncPointer, ev.xbutton.time);
-                if (n != mon_focused(mi)) setfocus(mi, n, 1);
-                else {
-                    XRaiseWindow(dpy, n->win);
-                    raise_floating(mon_floating_at(mi, curws));
-                }
+            if (n != mon_focused(mi)) setfocus(mi, n, 1);
+            else {
+                XRaiseWindow(dpy, n->win);
+                raise_floating(mon_tree(mi));
+            }
 
+            {
                 Window dw;
                 unsigned gw, gh, gb, gd;
                 XGetGeometry(dpy, n->win, &dw, &drag_wx, &drag_wy, &gw, &gh, &gb, &gd);
                 drag_ww = (int)gw;
                 drag_wh = (int)gh;
-                drag_ox = ev.xbutton.x_root;
-                drag_oy = ev.xbutton.y_root;
-                drag_node = n;
-                drag_mon = mi;
-                drag_mode = ev.xbutton.button == Button1 ? 1 : 2;
-
-                XGrabPointer(dpy, root, False, PointerMotionMask | ButtonReleaseMask,
-                    GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
-            } else {
-                XAllowEvents(dpy, ReplayPointer, ev.xbutton.time);
-                if (n && n != mon_focused(mi)) {
-                    setfocus(mi, n, 1);
-                    retile();
-                } else if (n) {
-                    XRaiseWindow(dpy, n->win);
-                }
             }
+            drag_ox = ev.xbutton.x_root;
+            drag_oy = ev.xbutton.y_root;
+            drag_node = n;
+            drag_mon = mi;
+            drag_mode = ev.xbutton.button == Button1 ? 1 : 2;
+
+            XGrabPointer(dpy, root, False, PointerMotionMask | ButtonReleaseMask,
+                GrabModeAsync, GrabModeAsync, None,
+                drag_mode == 1 ? movecursor : resizecursor, CurrentTime);
             break;
         }
 
@@ -1906,8 +2220,10 @@ int main(void) {
                     XQueryPointer(dpy, root, &dw, &dw, &rx, &ry, &wx2, &wy2, &msk);
                     int newmon = monforpt(rx, ry);
                     if (newmon != drag_mon) {
-                        detach_floating(drag_mon, drag_node);
-                        attach_floating(newmon, drag_node);
+                        int was_floating = drag_node->floating;
+                        detach(drag_mon, drag_node);
+                        attach(newmon, drag_node);
+                        drag_node->floating = was_floating;
                         curmon = newmon;
                         retile();
                     }
@@ -1915,6 +2231,7 @@ int main(void) {
             }
             drag_mode = 0;
             drag_node = NULL;
+            drag_ww = drag_wh = 0;
             break;
 
         case MotionNotify:
@@ -1930,7 +2247,8 @@ int main(void) {
                     int nx = drag_wx + dx;
                     int ny = drag_wy + dy;
                     if (nx < 0) nx = 0;
-                    if (ny < barh) ny = barh;
+                    if (barpos == BAR_TOP && ny < barh) ny = barh;
+                    if (barpos == BAR_BOTTOM && ny < 0) ny = 0;
                     if (nx + drag_ww + 2 * bw > sw) nx = sw - drag_ww - 2 * bw;
                     if (ny + drag_wh + 2 * bw > sh) ny = sh - drag_wh - 2 * bw;
                     XMoveWindow(dpy, drag_node->win, nx, ny);
@@ -1952,24 +2270,40 @@ int main(void) {
             state &= ~(LockMask | numlockmask);
             KeySym sym = XLookupKeysym(&ev.xkey, 0);
 
-            if (state == (ControlMask | Mod4Mask) && sym == XK_Left) {
-                apply_wm_action("wm:swap_prev");
+            if (state == (ControlMask | Mod4Mask) && (sym == XK_Left || sym == XK_KP_Left)) {
+                apply_wm_action("wm:swap_left");
                 break;
             }
-            if (state == (ControlMask | Mod4Mask) && sym == XK_Right) {
-                apply_wm_action("wm:swap_next");
+            if (state == (ControlMask | Mod4Mask) && (sym == XK_Right || sym == XK_KP_Right)) {
+                apply_wm_action("wm:swap_right");
+                break;
+            }
+            if (state == (ControlMask | Mod4Mask) && (sym == XK_Up || sym == XK_KP_Up)) {
+                apply_wm_action("wm:swap_up");
+                break;
+            }
+            if (state == (ControlMask | Mod4Mask) && (sym == XK_Down || sym == XK_KP_Down)) {
+                apply_wm_action("wm:swap_down");
                 break;
             }
             if (state == 0 && (sym == XK_Print || sym == XK_Sys_Req)) {
                 apply_wm_action("wm:screenshot");
                 break;
             }
-            if (state == MOD && sym == XK_Left) {
+            if (state == MOD && (sym == XK_Left || sym == XK_KP_Left)) {
                 apply_wm_action("wm:focus_prev");
                 break;
             }
-            if (state == MOD && sym == XK_Right) {
+            if (state == MOD && (sym == XK_Right || sym == XK_KP_Right)) {
                 apply_wm_action("wm:focus_next");
+                break;
+            }
+            if (state == MOD && (sym == XK_Up || sym == XK_KP_Up)) {
+                apply_wm_action("wm:focus_up");
+                break;
+            }
+            if (state == MOD && (sym == XK_Down || sym == XK_KP_Down)) {
+                apply_wm_action("wm:focus_down");
                 break;
             }
 
