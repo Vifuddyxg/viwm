@@ -69,6 +69,8 @@ typedef struct {
     int wx, wy, ww, wh;
     Node *tree[MAXWS], *focused[MAXWS];
     Window barwin;
+    Pixmap barpix;
+    int barpixw, barpixh;
 } Mon;
 
 typedef enum {
@@ -140,6 +142,8 @@ static Atom atom_net_wm_window_type_splash;
 static Atom atom_net_wm_desktop;
 static Atom atom_net_wm_state;
 static Atom atom_net_wm_state_fullscreen;
+static Atom atom_net_wm_name;
+static char cached_title[256];
 static char cmdline[CMDLINE_MAX];
 static int cmdline_len;
 static char timestr[32];
@@ -250,8 +254,14 @@ static KeySym parse_keysym_name(const char *name) {
 }
 
 static int textw(const char *s) {
-    return s ? ((barfont && XTextWidth(barfont, s, (int)strlen(s))) ? XTextWidth(barfont, s, (int)strlen(s)) : (int)strlen(s) * 8) : 0;
+    int len, w;
+    if (!s) return 0;
+    len = (int)strlen(s);
+    if (!barfont) return len * 8;
+    w = XTextWidth(barfont, s, len);
+    return w ? w : len * 8;
 }
+
 
 static void build_mode_text(char *dst, size_t dstsz) {
     const char *label = mode == MODE_INSERT ? "INSERT" :
@@ -266,36 +276,33 @@ static int clampi(int value, int minv, int maxv) {
 }
 
 static int get_window_title(Window win, char *dst, size_t dstsz) {
-    Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
-    Atom utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
     XTextProperty prop;
     char **list = NULL;
-    int count = 0;
+    int count = 0, ok;
 
     dst[0] = 0;
-    if (XGetTextProperty(dpy, win, &prop, net_wm_name) && prop.value && prop.nitems > 0) {
-        if (prop.encoding == utf8_string) {
+    if (XGetTextProperty(dpy, win, &prop, atom_net_wm_name) && prop.value && prop.nitems > 0) {
+        if (prop.encoding == atom_utf8_string) {
             copystr(dst, dstsz, (char *)prop.value);
             XFree(prop.value);
             return dst[0] != 0;
         }
-        if (XmbTextPropertyToTextList(dpy, &prop, &list, &count) >= Success && count > 0 && list && list[0]) {
+        ok = XmbTextPropertyToTextList(dpy, &prop, &list, &count);
+        if (ok >= Success && count > 0 && list && list[0])
             copystr(dst, dstsz, list[0]);
-            XFreeStringList(list);
-            XFree(prop.value);
-            return dst[0] != 0;
-        }
+        if (ok >= Success && list) XFreeStringList(list);
         XFree(prop.value);
+        list = NULL;
+        if (dst[0]) return 1;
     }
 
     if (XGetWMName(dpy, win, &prop) && prop.value && prop.nitems > 0) {
-        if (XmbTextPropertyToTextList(dpy, &prop, &list, &count) >= Success && count > 0 && list && list[0]) {
+        ok = XmbTextPropertyToTextList(dpy, &prop, &list, &count);
+        if (ok >= Success && count > 0 && list && list[0])
             copystr(dst, dstsz, list[0]);
-            XFreeStringList(list);
-            XFree(prop.value);
-            return dst[0] != 0;
-        }
+        if (ok >= Success && list) XFreeStringList(list);
         XFree(prop.value);
+        if (dst[0]) return 1;
     }
     return 0;
 }
@@ -339,11 +346,14 @@ static int window_has_atom(Window win, Atom prop, Atom value) {
     return found;
 }
 
-static void build_title_text(char *dst, size_t dstsz) {
+static void refresh_cached_title(void) {
     Node *n = mon_focused(curmon);
-    dst[0] = 0;
-    if (!n || !n->leaf) return;
-    get_window_title(n->win, dst, dstsz);
+    cached_title[0] = 0;
+    if (n && n->leaf) get_window_title(n->win, cached_title, sizeof cached_title);
+}
+
+static void build_title_text(char *dst, size_t dstsz) {
+    copystr(dst, dstsz, cached_title);
 }
 
 static void build_clock_text(char *dst, size_t dstsz) {
@@ -833,21 +843,35 @@ static int draw_section(Window win, int x, int y, const char *cfg) {
 }
 
 static void drawbar(int mi) {
-    if (!mons[mi].barwin) return;
+    Mon *m = &mons[mi];
+    if (!m->barwin) return;
+    if (m->barpix && (m->barpixw != m->w || m->barpixh != barh)) {
+        XFreePixmap(dpy, m->barpix);
+        m->barpix = None;
+        m->barpixw = m->barpixh = 0;
+    }
+    if (!m->barpix) {
+        m->barpix = XCreatePixmap(dpy, m->barwin, m->w, barh,
+            DefaultDepth(dpy, DefaultScreen(dpy)));
+        m->barpixw = m->w;
+        m->barpixh = barh;
+    }
+    if (!m->barpix) return;
     int leftx = barpadx, centx, rightx, leftw;
     int centerw = section_width(barcentercfg);
     int rightw = section_width(barrightcfg);
 
     XSetForeground(dpy, bargc, barbg);
-    XFillRectangle(dpy, mons[mi].barwin, bargc, 0, 0, mons[mi].w, barh);
+    XFillRectangle(dpy, m->barpix, bargc, 0, 0, m->w, barh);
 
     leftw = section_width(barleftcfg);
-    draw_section(mons[mi].barwin, leftx, 0, barleftcfg);
-    rightx = mons[mi].w - rightw - barpadx;
-    if (rightw > 0) draw_section(mons[mi].barwin, rightx, 0, barrightcfg);
-    centx = (mons[mi].w - centerw) / 2;
+    draw_section(m->barpix, leftx, 0, barleftcfg);
+    rightx = m->w - rightw - barpadx;
+    if (rightw > 0) draw_section(m->barpix, rightx, 0, barrightcfg);
+    centx = (m->w - centerw) / 2;
     if (centerw > 0 && centx > leftx + leftw + 12 && centx + centerw < rightx - 12)
-        draw_section(mons[mi].barwin, centx, 0, barcentercfg);
+        draw_section(m->barpix, centx, 0, barcentercfg);
+    XCopyArea(dpy, m->barpix, m->barwin, bargc, 0, 0, m->w, barh, 0, 0);
 }
 
 static int bar_uses_item(const char *item) {
@@ -913,6 +937,7 @@ static void setfocus(int mi, Node *n, int warp) {
     raise_bar_if_needed(mi);
     if (warp) warpfocus(n);
     update_active_window();
+    refresh_cached_title();
 }
 
 static void showtree(Node *n) {
@@ -942,16 +967,17 @@ static void initatoms(void) {
     atom_net_wm_desktop = XInternAtom(dpy, "_NET_WM_DESKTOP", False);
     atom_net_wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
     atom_net_wm_state_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+    atom_net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
 }
 
 static void setup_wm_check(void) {
-    static const char name[] = "nvwm";
+    static const char name[] = "viwm";
     wmcheckwin = XCreateSimpleWindow(dpy, root, -1, -1, 1, 1, 0, 0, 0);
     XChangeProperty(dpy, wmcheckwin, atom_net_supporting_wm_check, XA_WINDOW, 32,
         PropModeReplace, (unsigned char *)&wmcheckwin, 1);
     XChangeProperty(dpy, root, atom_net_supporting_wm_check, XA_WINDOW, 32,
         PropModeReplace, (unsigned char *)&wmcheckwin, 1);
-    XChangeProperty(dpy, wmcheckwin, XInternAtom(dpy, "_NET_WM_NAME", False),
+    XChangeProperty(dpy, wmcheckwin, atom_net_wm_name,
         atom_utf8_string, 8, PropModeReplace, (const unsigned char *)name, (int)strlen(name));
 }
 
@@ -1114,14 +1140,14 @@ static void detach_from_ws(int mi, int ws, Node *n) {
 static void detach(int mi, Node *n) { detach_from_ws(mi, curws, n); }
 
 static void removewin(Window w) {
-    int mi = monforwin(w);
-    Node *n = findleaf(mon_tree(mi), w);
+    int mi = 0, ws = 0;
+    Node *n = findleaf_any(w, &mi, &ws);
     if (!n) return;
     if (drag_node == n) {
         drag_node = NULL;
         drag_mode = 0;
     }
-    detach(mi, n);
+    detach_from_ws(mi, ws, n);
     free(n);
     update_active_window();
 }
@@ -1252,6 +1278,7 @@ static void screenshot(void) {
 static void spawn(const char *cmd) {
     if (fork() == 0) {
         setsid();
+        close(ConnectionNumber(dpy));
         execlp("sh", "sh", "-c", cmd, NULL);
         _exit(0);
     }
@@ -1566,14 +1593,15 @@ static void loadcfg(void) {
     char homecfg[PATH_MAX];
     const char *home = getenv("HOME");
     if (home && *home) {
-        snprintf(homecfg, sizeof homecfg, "%s/.config/nvwm/config.conf", home);
+        snprintf(homecfg, sizeof homecfg, "%s/.config/viwm/config.conf", home);
     } else {
         homecfg[0] = 0;
     }
 
     reset_config_defaults();
+    loadcfg_file("/etc/viwm/config.conf");
+    loadcfg_file("./config.conf");
     if (homecfg[0]) loadcfg_file(homecfg);
-    else loadcfg_file("/etc/nvwm/config.conf");
 }
 
 static void run_autostart(void) {
@@ -1983,9 +2011,9 @@ static void setupbars(void) {
         XClearWindow(dpy, m->barwin);
         XChangeProperty(dpy, m->barwin, atom_net_wm_window_type, XA_ATOM, 32,
             PropModeReplace, (unsigned char *)dock_type, 1);
-        XStoreName(dpy, m->barwin, "nvwm-bar");
-        hint.res_name = "nvwm-bar";
-        hint.res_class = "NVWMBar";
+        XStoreName(dpy, m->barwin, "viwm-bar");
+        hint.res_name = "viwm-bar";
+        hint.res_class = "VIWMBar";
         XSetClassHint(dpy, m->barwin, &hint);
         XDefineCursor(dpy, m->barwin, normalcursor);
         XSelectInput(dpy, m->barwin, ExposureMask);
@@ -2117,6 +2145,13 @@ int main(void) {
         case PropertyNotify:
             if (ev.xproperty.atom == atom_net_wm_state) {
                 sync_window_fullscreen(ev.xproperty.window);
+            }
+            if (ev.xproperty.atom == atom_net_wm_name || ev.xproperty.atom == XA_WM_NAME) {
+                Node *n = mon_focused(curmon);
+                if (n && n->leaf && n->win == ev.xproperty.window) {
+                    refresh_cached_title();
+                    drawbars();
+                }
             }
             break;
 
@@ -2335,6 +2370,9 @@ int main(void) {
     }
 
     if (keyboard_grabbed) XUngrabKeyboard(dpy, CurrentTime);
+    for (int i = 0; i < nmons; i++) {
+        if (mons[i].barpix) XFreePixmap(dpy, mons[i].barpix);
+    }
     XCloseDisplay(dpy);
     return 0;
 }
